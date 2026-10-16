@@ -1,0 +1,42 @@
+{
+  "name": "web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "test": "bun test ./test",
+    "test:e2e": "playwright test",
+    "build": "tsc -b && vite build",
+    "lint": "oxlint",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@bitcoinerlab/secp256k1": "^2.0.0",
+    "@price-oracle/sdk": "file:../../price-oracle/web/sdk",
+    "@vulpemventures/secp256k1-zkp": "^3.2.1",
+    "bip32": "^5.0.0",
+    "buffer": "^6.0.3",
+    "ecpair": "^3.0.2",
+    "events": "^3.3.0",
+    "liquidjs-lib": "^6.0.2-liquid.38",
+    "lucide-react": "^1.44.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "stream-browserify": "^3.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "oxlint": "^1.81.0",
+    "typescript": "~6.0.2",
+    "vite": "^8.3.0",
+    "vite-plugin-node-polyfills": "^0.28.0"
+  },
+  "patchedDependencies": {
+    "liquidjs-lib@6.0.2-liquid.38": "patches/liquidjs-lib@6.0.2-liquid.38.patch"
+  }
+}

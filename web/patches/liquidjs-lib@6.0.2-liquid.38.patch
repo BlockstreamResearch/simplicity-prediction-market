@@ -1,0 +1,47 @@
+diff --git a/src/psetv2/globals.js b/src/psetv2/globals.js
+index 91910466a5ede414e12108f54496562d71c21020..0c3c08e9942348faa40ac836e881cef7022f4adf 100644
+--- a/src/psetv2/globals.js
++++ b/src/psetv2/globals.js
+@@ -48,12 +48,12 @@ class PsetGlobal {
+       switch (kp.key.keyType) {
+         case fields_1.GlobalTypes.XPUB:
+           if (
+-            kp.key.keyData.length !== pubKeyLength + 1 &&
+-            ![2, 3].includes(kp.key.keyData[46])
++            kp.key.keyData.length !== pubKeyLength ||
++            ![2, 3].includes(kp.key.keyData[45])
+           ) {
+             throw new Error('Invalid xpub length');
+           }
+-          const extendedKey = kp.key.keyData.slice(1);
++          const extendedKey = kp.key.keyData;
+           const { masterFingerprint, path: derivationPath } = (0,
+           bip32_1.decodeBip32Derivation)(kp.value);
+           if (!global.xpubs) {
+@@ -205,11 +205,10 @@ class PsetGlobal {
+     if (this.xpubs && this.xpubs.length > 0) {
+       this.xpubs.forEach(
+         ({ extendedKey, masterFingerprint, derivationPath }) => {
+-          const keyData = Buffer.concat([
+-            Buffer.of(extendedKey.length),
++          const key = new key_pair_1.Key(
++            fields_1.GlobalTypes.XPUB,
+             extendedKey,
+-          ]);
+-          const key = new key_pair_1.Key(fields_1.GlobalTypes.XPUB, keyData);
++          );
+           const value = (0, bip32_1.encodeBIP32Derivation)(
+             masterFingerprint,
+             derivationPath,
+diff --git a/src/psetv2/input.js b/src/psetv2/input.js
+--- a/src/psetv2/input.js
++++ b/src/psetv2/input.js
+@@ -899,7 +899,7 @@ class PsetInput {
+       sequence.writeUInt32LE(this.sequence);
+       keyPairs.push(new key_pair_1.KeyPair(sequenceKey, sequence));
+     }
+-    if (this.requiredTimeLocktime !== undefined) {
++    if (this.requiredTimeLocktime > 0) {
+       const key = new key_pair_1.Key(
+         fields_1.InputTypes.REQUIRED_TIME_LOCKTIME,
+       );

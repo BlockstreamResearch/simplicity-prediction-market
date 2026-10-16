@@ -1,0 +1,39 @@
+use std::lib::asserts::assert_eq_256;
+use std::lib::u64::convert::u64_to_u256;
+
+use crate::helper::{assert_payout_preserves_position, get_explicit_input_amount};
+
+fn resolution_hash(occurred_at: u64) -> u256 {
+    let context: Ctx8 = jet::sha_256_ctx_8_init();
+    let context: Ctx8 = jet::sha_256_ctx_8_add_32(context, param::PREDICTION_ID);
+    let context: Ctx8 = jet::sha_256_ctx_8_add_32(context, u64_to_u256(occurred_at));
+
+    jet::sha_256_ctx_8_finalize(context)
+}
+
+fn main() {
+    let occurred_at: u64 = witness::OCCURRED_AT;
+    let admin_signature: Signature = witness::ADMIN_SIGNATURE;
+    let tick_input_index: u32 = witness::TICK_INPUT_INDEX;
+    let payout_output_index: u32 = witness::PAYOUT_OUTPUT_INDEX;
+
+    assert!(jet::le_64(occurred_at, param::DEADLINE));
+    jet::bip_0340_verify(
+        (param::ADMIN_PUBKEY, resolution_hash(occurred_at)),
+        admin_signature,
+    );
+
+    let (tick_asset, tick_timestamp): (u256, u64) = get_explicit_input_amount(tick_input_index);
+    assert_eq_256(tick_asset, param::TICK_ASSET_ID);
+    assert_eq_256(
+        unwrap(jet::input_script_hash(tick_input_index)),
+        param::TICK_SCRIPT_HASH,
+    );
+    assert!(jet::le_64(occurred_at, tick_timestamp));
+
+    assert_eq_256(
+        unwrap(jet::output_script_hash(payout_output_index)),
+        param::PAYOUT_SCRIPT_HASH,
+    );
+    assert_payout_preserves_position(payout_output_index);
+}

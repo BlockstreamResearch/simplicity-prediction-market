@@ -1,0 +1,7 @@
+target/
+/data
+/server/config.toml
+/web/dist
+/web/node_modules
+.DS_Store
+/contracts/deps

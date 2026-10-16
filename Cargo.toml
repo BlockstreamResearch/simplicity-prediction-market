@@ -1,0 +1,28 @@
+[workspace]
+members = ["contracts", "server"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+
+[workspace.dependencies]
+axum = "0.8"
+anyhow = "1"
+hex = "0.4"
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+secp256k1 = { version = "0.31", features = ["rand"] }
+simplex = { package = "smplx-std", version = "0.0.12" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2.6"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.9"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }

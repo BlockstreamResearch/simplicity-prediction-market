@@ -1,0 +1,21 @@
+listen_address = "127.0.0.1:8787"
+data_file = "data/predictions.json"
+admin_login = "admin"
+admin_password = "change-me"
+# Development-only key. Replace it before sharing a deployment.
+admin_private_key = "1111111111111111111111111111111111111111111111111111111111111111"
+# Must match the target Elements chain. Both values are committed by Simplicity signatures.
+policy_asset_id = "b2e15d0d7a0c94e4e2ce0fe6e8691b9e451377f6e46e8045a86f7c4b5d4f0f23"
+genesis_block_hash = "cd179c84c35f51825f20a3b91a18d45f0c53b5ceb744a5b6ef8f0babe809396f"
+session_lifetime_seconds = 3600
+oracle_url = "http://127.0.0.1:9100"
+
+[chain_backend]
+esplora_url = "http://127.0.0.1:3001"
+rpc_url = "http://127.0.0.1:18884"
+rpc_username = "high-storm"
+rpc_password = "high-storm"
+
+[escrow]
+private_key_file = "data/escrow-private-key.hex"
+max_stake_sats = 1000000

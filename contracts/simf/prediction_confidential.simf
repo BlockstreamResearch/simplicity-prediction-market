@@ -1,0 +1,59 @@
+use std::lib::asserts::assert_eq_256;
+use std::lib::u64::convert::u64_to_u256;
+
+use crate::helper::get_explicit_input_amount;
+
+fn resolution_hash(occurred_at: u64) -> u256 {
+    let context: Ctx8 = jet::sha_256_ctx_8_init();
+    let context: Ctx8 = jet::sha_256_ctx_8_add_32(context, param::PREDICTION_ID);
+    let context: Ctx8 = jet::sha_256_ctx_8_add_32(context, u64_to_u256(occurred_at));
+    jet::sha_256_ctx_8_finalize(context)
+}
+
+fn commitment_point(commitment: Point) -> Ge {
+    let (parity, x): (u1, u256) = commitment;
+    let (x, y): Ge = unwrap(jet::decompress((0, x)));
+    let quadratic: u1 = match jet::fe_square_root(y) {
+        Some(_: u256) => 0,
+        None => 1,
+    };
+    match jet::eq_1(quadratic, parity) {
+        true => (x, y),
+        false => jet::ge_negate((x, y)),
+    }
+}
+
+fn proof_key(actual: Ge, expected: Ge) -> Pubkey {
+    let difference: Gej = jet::gej_add((actual, 1), (jet::ge_negate(expected), 1));
+    let (x, _): Ge = unwrap(jet::gej_normalize(difference));
+    x
+}
+
+fn main() {
+    let occurred_at: u64 = witness::OCCURRED_AT;
+    let tick_input_index: u32 = witness::TICK_INPUT_INDEX;
+    let payout_output_index: u32 = witness::PAYOUT_OUTPUT_INDEX;
+    let digest: u256 = resolution_hash(occurred_at);
+
+    assert!(jet::le_64(occurred_at, param::DEADLINE));
+    jet::bip_0340_verify((param::ADMIN_PUBKEY, digest), witness::ADMIN_SIGNATURE);
+
+    let (tick_asset, tick_timestamp): (u256, u64) = get_explicit_input_amount(tick_input_index);
+    assert_eq_256(tick_asset, param::TICK_ASSET_ID);
+    assert_eq_256(unwrap(jet::input_script_hash(tick_input_index)), param::TICK_SCRIPT_HASH);
+    assert!(jet::le_64(occurred_at, tick_timestamp));
+    assert_eq_256(unwrap(jet::output_script_hash(payout_output_index)), param::PAYOUT_SCRIPT_HASH);
+
+    let (asset, amount): (Asset1, Amount1) = jet::current_amount();
+    let asset: u256 = unwrap_right::<Point>(asset);
+    let amount: u64 = unwrap_right::<Point>(amount);
+    let (payout_asset, payout_amount): (Asset1, Amount1) = unwrap(jet::output_amount(payout_output_index));
+    let payout_asset: Ge = commitment_point(unwrap_left::<u256>(payout_asset));
+    let payout_amount: Ge = commitment_point(unwrap_left::<u64>(payout_amount));
+
+    let asset_key: Pubkey = proof_key(payout_asset, jet::hash_to_curve(asset));
+    jet::bip_0340_verify((asset_key, digest), witness::PAYOUT_ASSET_PROOF);
+    let amount_point: Ge = unwrap(jet::gej_normalize(jet::scale(u64_to_u256(amount), (payout_asset, 1))));
+    let value_key: Pubkey = proof_key(payout_amount, amount_point);
+    jet::bip_0340_verify((value_key, digest), witness::PAYOUT_VALUE_PROOF);
+}
