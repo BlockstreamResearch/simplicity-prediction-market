@@ -4,6 +4,210 @@ use price_feed::PriceFeedData;
 use price_oracle_contracts::sdk::SignedPrice;
 use simplex::simplicityhl::elements::secp256k1_zkp::XOnlyPublicKey;
 
+const AUTO_PUBLISH_INTERVAL: u64 = 12 * 60 * 60;
+
+#[derive(Clone, Deserialize)]
+pub struct OracleVerificationConfig {
+    pub storm_eye_asset_id: String,
+    pub tick_asset_id: String,
+    pub verifier_asset_id: String,
+    pub storm_tree_root: String,
+}
+
+#[derive(Deserialize)]
+struct CoordinatorVerification {
+    #[serde(flatten)]
+    account: OracleAccount,
+    storm_tree_root: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct VerificationRequest {
+    owner_public_key: String,
+    auth_script_pubkey: String,
+}
+
+pub(super) async fn verification(
+    State(state): State<AppState>,
+    Json(request): Json<VerificationRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use price_oracle_contracts::artifacts::account::{
+        AccountProgram, derived_account::AccountArguments,
+    };
+
+    let owner = parse_hex_array::<32>(&request.owner_public_key, "owner public key")?;
+    XOnlyPublicKey::from_slice(&owner)
+        .map_err(|_| ApiError::bad_request("invalid owner public key"))?;
+    let auth = parse_script(&request.auth_script_pubkey, "authentication script")?;
+    if !auth.is_v0_p2wpkh() {
+        return Err(ApiError::bad_request(
+            "authentication requires a Humid P2WPKH script",
+        ));
+    }
+    let trusted = if state.config.trust_coordinator {
+        let metadata: CoordinatorVerification =
+            serde_json::from_value(oracle_json(&state, "/users/network").await?)
+                .map_err(|_| ApiError::internal("invalid oracle verification metadata"))?;
+        let account = validate_network(&state, metadata.account)?;
+        OracleVerificationConfig {
+            storm_eye_asset_id: account.storm_eye_asset_id,
+            tick_asset_id: account.tick_asset_id,
+            verifier_asset_id: account.oracle_verifier_asset_id,
+            storm_tree_root: metadata.storm_tree_root,
+        }
+    } else {
+        state.config.oracle_verification.clone().ok_or_else(|| {
+            ApiError::conflict("independent oracle verification anchors are not configured")
+        })?
+    };
+    let storm_eye = parse_asset(&trusted.storm_eye_asset_id, "trusted Storm Eye asset")?;
+    let tick = parse_asset(&trusted.tick_asset_id, "trusted Tick asset")?;
+    let verifier = parse_asset(&trusted.verifier_asset_id, "trusted Verifier asset")?;
+    let root = parse_hex_array::<32>(&trusted.storm_tree_root, "trusted Storm Tree root")?;
+    let account = AccountProgram::new(&AccountArguments {
+        storm_eye_asset_id: storm_eye.to_byte_array(),
+        account_owner_pubkey: owner,
+    });
+    let voucher = Voucher::new(VoucherParameters {
+        storm_eye_asset_id: storm_eye,
+        auth_method: VoucherAuthMethod::Script {
+            auth_script_hash: hash_script(&auth),
+        },
+        network: state.network,
+    });
+
+    Ok(Json(serde_json::json!({
+        "ownerPublicKey": hex::encode(owner),
+        "network": state.oracle_network(),
+        "stormEyeAssetId": storm_eye.to_string(),
+        "tickAssetId": tick.to_string(),
+        "verifierAssetId": verifier.to_string(),
+        "stormTreeRoot": hex::encode(root),
+        "accountTapleafHash": hex::encode(account.get_tapleaf_hash()),
+        "tickTapleafHash": hex::encode(voucher.get_tapleaf_hash()),
+        "authScriptPubKey": hex::encode(auth.as_bytes()),
+    })))
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct AutoPublishConfig {
+    pub enabled: bool,
+    pub feed_id: u32,
+}
+
+pub(super) async fn run_auto_publisher(state: &AppState) {
+    if !state.config.auto_publish.enabled {
+        std::future::pending::<()>().await;
+        return;
+    }
+
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let result = match unix_time() {
+            Ok(now) => publish_scheduled(state, now).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            tracing::warn!(%error.message, "automatic prediction publication failed; retrying next minute");
+        }
+    }
+}
+
+async fn publish_scheduled(state: &AppState, now: u64) -> Result<bool, ApiError> {
+    if !state.config.auto_publish.enabled {
+        return Ok(false);
+    }
+    let feed_id = state.config.auto_publish.feed_id;
+    let slot = now / AUTO_PUBLISH_INTERVAL * AUTO_PUBLISH_INTERVAL;
+    let deadline = slot
+        .checked_add(AUTO_PUBLISH_INTERVAL)
+        .ok_or_else(|| ApiError::internal("automatic prediction deadline overflow"))?;
+    let id = hex::encode(Sha256::digest(format!(
+        "auto-price-v1:{}:{feed_id}:{slot}",
+        state.config.genesis_block_hash,
+    )));
+    if state.db.find(&id).await?.is_some() {
+        return Ok(false);
+    }
+    let wallet = state.reserve_wallet.as_ref().ok_or_else(|| {
+        ApiError::internal("automatic publishing requires a local reserve wallet")
+    })?;
+    let started_at = tokio::time::Instant::now();
+    let latest = oracle_json(state, &format!("/price-feeds/{feed_id}")).await?;
+    let data: PriceFeedData = serde_json::from_value(latest["main"]["feed"].clone())
+        .map_err(|_| ApiError::internal("invalid latest oracle price"))?;
+    if data.feed_id != feed_id
+        || data.price == 0
+        || data.received_at > now
+        || data.valid_until <= now
+    {
+        return Err(ApiError::conflict(
+            "latest oracle price is stale or invalid",
+        ));
+    }
+    let above = secp256k1::rand::random::<bool>();
+    let strike = automatic_strike(data.price, above)?;
+    let price = publish(
+        state,
+        PriceMarketRequest {
+            feed_id,
+            strike: strike.to_string(),
+            above,
+            opens_at: now,
+            claim_grace: default_grace(),
+            house_script_pubkey: hex::encode(wallet.script_pubkey().as_bytes()),
+        },
+        deadline,
+    )
+    .await?;
+    if price.decimals != data.decimals {
+        return Err(ApiError::conflict("oracle feed decimals changed"));
+    }
+    if now.saturating_add(started_at.elapsed().as_secs()) >= deadline {
+        return Err(ApiError::conflict(
+            "automatic prediction window has expired",
+        ));
+    }
+
+    let market = if feed_id == 0 {
+        "BTC/USD".into()
+    } else {
+        format!("Price feed {feed_id}")
+    };
+    let title = format!(
+        "{market} reaches {}1% by {:02}:{:02} UTC",
+        if above { "+" } else { "-" },
+        deadline / 3600 % 24,
+        deadline / 60 % 60,
+    );
+    let inserted = state
+        .db
+        .insert(&Prediction {
+            id: id.clone(),
+            title,
+            deadline,
+            created_at: now,
+            price,
+        })
+        .await?;
+    if inserted {
+        tracing::info!(%id, feed_id, deadline, "automatically published prediction");
+    }
+    Ok(inserted)
+}
+
+fn automatic_strike(price: u64, above: bool) -> Result<u64, ApiError> {
+    let strike = if above {
+        (u128::from(price) * 101).div_ceil(100)
+    } else {
+        u128::from(price) * 99 / 100
+    };
+    u64::try_from(strike).map_err(|_| ApiError::internal("automatic prediction strike overflow"))
+}
+
 pub(super) fn default_oracle_url() -> String {
     "http://127.0.0.1:9100".into()
 }
@@ -31,7 +235,6 @@ pub(super) struct PriceMarketRequest {
     #[serde(default = "default_grace")]
     claim_grace: u64,
     house_script_pubkey: String,
-    owner_public_key: String,
 }
 
 fn default_grace() -> u64 {
@@ -46,8 +249,8 @@ pub(super) struct OracleAccount {
     network: String,
 }
 
-async fn oracle_json(state: &AppState, path: &str) -> Result<serde_json::Value, ApiError> {
-    let response = state
+async fn oracle_response(state: &AppState, path: &str) -> Result<reqwest::Response, ApiError> {
+    state
         .chain_client
         .get(format!(
             "{}{path}",
@@ -55,7 +258,11 @@ async fn oracle_json(state: &AppState, path: &str) -> Result<serde_json::Value, 
         ))
         .send()
         .await
-        .map_err(|_| ApiError::internal("oracle unavailable"))?;
+        .map_err(|_| ApiError::internal("oracle unavailable"))
+}
+
+async fn oracle_json(state: &AppState, path: &str) -> Result<serde_json::Value, ApiError> {
+    let response = oracle_response(state, path).await?;
     if !response.status().is_success() {
         return Err(ApiError::conflict("oracle feed or network is unavailable"));
     }
@@ -69,13 +276,54 @@ pub(super) async fn account(state: &AppState, owner: &str) -> Result<OracleAccou
     let bytes = parse_hex_array::<32>(owner, "owner public key")?;
     XOnlyPublicKey::from_slice(&bytes)
         .map_err(|_| ApiError::bad_request("invalid owner public key"))?;
-    let account: OracleAccount =
+    let account =
         serde_json::from_value(oracle_json(state, &format!("/users/account/{owner}")).await?)
             .map_err(|_| ApiError::internal("invalid oracle account"))?;
+    validate_network(state, account)
+}
+
+pub(super) async fn network(state: &AppState) -> Result<OracleAccount, ApiError> {
+    let response = oracle_response(state, "/users/network").await?;
+    if !response.status().is_success() {
+        return Err(ApiError::conflict("oracle network metadata is unavailable"));
+    }
+    let metadata = response
+        .json()
+        .await
+        .map_err(|_| ApiError::internal("invalid oracle network metadata"))?;
+    validate_network(state, metadata)
+}
+
+fn validate_network(state: &AppState, account: OracleAccount) -> Result<OracleAccount, ApiError> {
     if account.network != state.oracle_network() {
         return Err(ApiError::bad_request(
             "oracle network does not match the configured prediction chain",
         ));
+    }
+    for (value, name) in [
+        (&account.tick_asset_id, "Tick asset"),
+        (&account.oracle_verifier_asset_id, "Verifier asset"),
+        (&account.storm_eye_asset_id, "Storm Eye asset"),
+    ] {
+        parse_asset(value, name)?;
+    }
+    if let Some(trusted) = &state.config.oracle_verification {
+        for (actual, expected) in [
+            (&account.tick_asset_id, &trusted.tick_asset_id),
+            (
+                &account.oracle_verifier_asset_id,
+                &trusted.verifier_asset_id,
+            ),
+            (&account.storm_eye_asset_id, &trusted.storm_eye_asset_id),
+        ] {
+            if parse_asset(actual, "oracle asset")?
+                != parse_asset(expected, "trusted oracle asset")?
+            {
+                return Err(ApiError::bad_request(
+                    "oracle assets do not match the configured trust anchors",
+                ));
+            }
+        }
     }
     Ok(account)
 }
@@ -141,14 +389,7 @@ pub(super) async fn publish(
         .as_u64()
         .and_then(|value| u32::try_from(value).ok())
         .ok_or_else(|| ApiError::internal("invalid feed decimals"))?;
-    let account = account(state, &request.owner_public_key).await?;
-    for (value, name) in [
-        (&account.tick_asset_id, "Tick asset"),
-        (&account.oracle_verifier_asset_id, "Verifier asset"),
-        (&account.storm_eye_asset_id, "Storm Eye asset"),
-    ] {
-        parse_asset(value, name)?;
-    }
+    let account = network(state).await?;
     Ok(PriceMarket {
         feed_id: request.feed_id,
         decimals,
@@ -167,12 +408,8 @@ fn contract(
     state: &AppState,
     prediction: &Prediction,
     payout: &Script,
-    requires_tick: bool,
 ) -> Result<PriceMarketContract, ApiError> {
-    let terms = prediction
-        .price
-        .as_ref()
-        .ok_or_else(|| ApiError::bad_request("not a price market"))?;
+    let terms = &prediction.price;
     let parameters = PriceMarketParameters {
         prediction_id: parse_prediction_id(&prediction.id)?,
         feed_id: terms.feed_id,
@@ -191,11 +428,7 @@ fn contract(
         house_script_hash: hash_script(&parse_script(&terms.house_script_pubkey, "house script")?),
         network: state.network,
     };
-    Ok(if requires_tick {
-        PriceMarketContract::new_with_tick(parameters)
-    } else {
-        PriceMarketContract::new(parameters)
-    })
+    Ok(PriceMarketContract::new_with_tick(parameters))
 }
 
 pub(super) async fn derive(
@@ -203,7 +436,7 @@ pub(super) async fn derive(
     prediction: &Prediction,
     request: &DeriveContractRequest,
 ) -> Result<Json<DerivedContract>, ApiError> {
-    let terms = prediction.price.as_ref().expect("checked price market");
+    let terms = &prediction.price;
     let payout = parse_script(&request.payout_script_pubkey, "payout script")?;
     if !payout.is_v0_p2wpkh() {
         return Err(ApiError::bad_request(
@@ -227,13 +460,10 @@ pub(super) async fn derive(
     }
     Ok(Json(DerivedContract {
         script_pubkey: hex::encode(
-            contract(state, prediction, &payout, true)?
+            contract(state, prediction, &payout)?
                 .get_script_pubkey()
                 .as_bytes(),
         ),
-        tick_asset_id: terms.tick_asset_id.clone(),
-        tick_script_pubkey: request.tick_script_pubkey.clone(),
-        confidential_payout: false,
     }))
 }
 
@@ -383,31 +613,15 @@ async fn settle(
     request: SettlementRequest,
     sweep: bool,
 ) -> Result<Json<RedemptionResponse>, ApiError> {
-    let prediction = state
-        .store
-        .read()
-        .await
-        .predictions
-        .iter()
-        .find(|item| item.id == id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("prediction does not exist"))?;
-    let terms = prediction
-        .price
-        .as_ref()
-        .ok_or_else(|| ApiError::bad_request("not a price market"))?;
+    let prediction = find_prediction(state, id).await?;
+    let terms = &prediction.price;
     let payout = parse_script(&request.payout_script_pubkey, "position payout script")?;
     let auth = parse_script(&request.auth_script_pubkey, "voucher authorization script")?;
     let position = parse_utxo(&request.position, "position")?;
     let proof = parse_utxo(&request.voucher, "voucher")?;
     let fee = parse_utxo(&request.fee, "fee")?;
-    let mut contract = contract(state, &prediction, &payout, true)?;
-    let legacy = position.txout.script_pubkey != contract.get_script_pubkey();
-    if legacy {
-        contract = self::contract(state, &prediction, &payout, false)?;
-    }
-    let requires_tick = !sweep && !legacy;
-    let tick = if requires_tick {
+    let contract = contract(state, &prediction, &payout)?;
+    let tick = if !sweep {
         Some(parse_utxo(
             request
                 .tick
@@ -447,10 +661,10 @@ async fn settle(
         },
         network: state.network,
     };
-    let mut program = VoucherProgram::new(&voucher_parameters.build_arguments());
+    let mut program = VoucherProgram::new(voucher_parameters.build_arguments());
     let tick_program = tick
         .as_ref()
-        .map(|_| VoucherProgram::new(&voucher_parameters.build_arguments()));
+        .map(|_| VoucherProgram::new(voucher_parameters.build_arguments()));
     let destination;
     let spend;
     if sweep {
@@ -496,22 +710,17 @@ async fn settle(
             XOnlyPublicKey::from_slice(&signed.get_signer())
                 .map_err(|_| ApiError::bad_request("invalid signer"))?,
         );
-        spend = if let Some(tick) = &tick {
-            verify_claim_tick(tick, &signed, terms)?;
-            PriceMarketSpend::ClaimWithTick {
-                tick_input_index: 2,
-                verifier_input_index: 1,
-                verifier_tapleaf_hash: program.get_tapleaf_hash(),
-                signed,
-                payout_output_index: 0,
-            }
-        } else {
-            PriceMarketSpend::Claim {
-                verifier_input_index: 1,
-                verifier_tapleaf_hash: program.get_tapleaf_hash(),
-                signed,
-                payout_output_index: 0,
-            }
+        verify_claim_tick(
+            tick.as_ref().expect("claim Tick was parsed"),
+            &signed,
+            terms,
+        )?;
+        spend = PriceMarketSpend::ClaimWithTick {
+            tick_input_index: 2,
+            verifier_input_index: 1,
+            verifier_tapleaf_hash: program.get_tapleaf_hash(),
+            signed,
+            payout_output_index: 0,
         };
         destination = payout;
     }
@@ -565,10 +774,7 @@ fn assemble(
     };
     transaction.add_program_input(
         PartialInput::new(proof.clone()),
-        ProgramInput::new(
-            Box::new(voucher.as_ref().clone()),
-            Box::new(path.build_witness()),
-        ),
+        ProgramInput::new(Box::new(voucher.as_ref().clone()), path.build_witness()),
         RequiredSignature::None,
     );
     if let Some((tick, program)) = &tick {
@@ -576,13 +782,11 @@ fn assemble(
             PartialInput::new(tick.clone()),
             ProgramInput::new(
                 Box::new(program.as_ref().clone()),
-                Box::new(
-                    VoucherSpendPath::ScriptAuth {
-                        auth_input_index: fee_index,
-                        voucher_output_index: 2,
-                    }
-                    .build_witness(),
-                ),
+                VoucherSpendPath::ScriptAuth {
+                    auth_input_index: fee_index,
+                    voucher_output_index: 2,
+                }
+                .build_witness(),
             ),
             RequiredSignature::None,
         );
@@ -626,9 +830,9 @@ fn assemble(
             .expect("covenant input");
         let witness = input
             .program
-            .finalize(&pset, &input.witness.build_witness(), index, &state.network)
+            .finalize(&pset, &input.witness, index, &state.network)
             .map_err(|error| ApiError::bad_request(format!("covenant input {index}: {error}")))?;
-        pset.inputs_mut()[index].final_script_witness = Some(witness);
+        pset.inputs_mut()[index].final_script_witness = Some(witness.into());
     }
     for input in pset.inputs_mut() {
         input.amount = None;
@@ -644,6 +848,171 @@ fn assemble(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn coordinator_trust_is_explicit_refreshes_metadata_and_fails_closed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let metadata = serde_json::json!({
+            "network": "elementsregtest",
+            "storm_eye_asset_id": "55".repeat(32),
+            "tick_asset_id": "33".repeat(32),
+            "oracle_verifier_asset_id": "44".repeat(32),
+            "storm_tree_root": "77".repeat(32),
+        });
+        let response = Arc::new(RwLock::new((StatusCode::OK, metadata.clone())));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response_state = response.clone();
+        let request_count = calls.clone();
+        let oracle = Router::new().route(
+            "/users/network",
+            get(move || {
+                let response = response_state.clone();
+                let calls = request_count.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    let (status, metadata) = response.read().await.clone();
+                    (status, Json(metadata))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = super::super::tests::config();
+        config.oracle_url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, oracle).await.unwrap() });
+        let request = || VerificationRequest {
+            owner_public_key: super::super::tests::HOLDER_PUBLIC_KEY.into(),
+            auth_script_pubkey: format!("0014{}", "11".repeat(20)),
+        };
+
+        let app = App::new(config.clone()).await.unwrap();
+        assert!(
+            verification(State(app.state), Json(request()))
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        config.oracle_verification = Some(OracleVerificationConfig {
+            storm_eye_asset_id: "55".repeat(32),
+            tick_asset_id: "33".repeat(32),
+            verifier_asset_id: "44".repeat(32),
+            storm_tree_root: "77".repeat(32),
+        });
+        let pinned_app = App::new(config.clone()).await.unwrap();
+        let Json(pinned_context) = verification(State(pinned_app.state), Json(request()))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        config.trust_coordinator = true;
+        assert!(matches!(
+            App::new(config.clone()).await,
+            Err(AppError::ConflictingOracleTrust)
+        ));
+        config.oracle_verification = None;
+        let app = App::new(config).await.unwrap();
+        let Json(context) = verification(State(app.state.clone()), Json(request()))
+            .await
+            .unwrap();
+        assert_eq!(context, pinned_context);
+        assert_eq!(context["stormTreeRoot"], "77".repeat(32));
+        assert_eq!(context["tickAssetId"], "33".repeat(32));
+        assert_eq!(context["verifierAssetId"], "44".repeat(32));
+        assert_eq!(context["accountTapleafHash"].as_str().unwrap().len(), 64);
+        let mut updated = metadata.clone();
+        updated["storm_tree_root"] = "88".repeat(32).into();
+        *response.write().await = (StatusCode::OK, updated);
+        let Json(context) = verification(State(app.state.clone()), Json(request()))
+            .await
+            .unwrap();
+        assert_eq!(context["stormTreeRoot"], "88".repeat(32));
+
+        for (field, value) in [
+            ("storm_tree_root", serde_json::Value::Null),
+            ("storm_tree_root", "invalid".into()),
+            ("network", "liquidtestnet".into()),
+            ("tick_asset_id", "invalid".into()),
+        ] {
+            let mut invalid = metadata.clone();
+            invalid[field] = value;
+            *response.write().await = (StatusCode::OK, invalid);
+            assert!(
+                verification(State(app.state.clone()), Json(request()))
+                    .await
+                    .is_err(),
+                "{field}"
+            );
+        }
+        *response.write().await = (StatusCode::SERVICE_UNAVAILABLE, metadata);
+        assert!(
+            verification(State(app.state.clone()), Json(request()))
+                .await
+                .is_err()
+        );
+        task.abort();
+        assert!(
+            verification(State(app.state), Json(request()))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_uses_configured_anchors_and_locally_compiled_leaves() {
+        use price_oracle_contracts::account::{Account, AccountParameters};
+
+        let mut config = super::super::tests::config();
+        let request = || VerificationRequest {
+            owner_public_key: super::super::tests::HOLDER_PUBLIC_KEY.into(),
+            auth_script_pubkey: format!("0014{}", "11".repeat(20)),
+        };
+        let app = App::new(config.clone()).await.unwrap();
+        assert!(
+            verification(State(app.state), Json(request()))
+                .await
+                .is_err()
+        );
+
+        config.oracle_verification = Some(OracleVerificationConfig {
+            storm_eye_asset_id: "55".repeat(32),
+            tick_asset_id: "33".repeat(32),
+            verifier_asset_id: "44".repeat(32),
+            storm_tree_root: "77".repeat(32),
+        });
+        let app = App::new(config).await.unwrap();
+        let Json(context) = verification(State(app.state.clone()), Json(request()))
+            .await
+            .unwrap();
+        let account = Account::new(AccountParameters {
+            storm_eye_asset_id: parse_asset(&"55".repeat(32), "asset").unwrap(),
+            account_owner_pubkey: parse_hex_array::<32>(&request().owner_public_key, "owner")
+                .unwrap(),
+            network: app.state.network,
+        });
+        assert_eq!(context["stormTreeRoot"], "77".repeat(32));
+        assert_eq!(context["tickAssetId"], "33".repeat(32));
+        assert_eq!(context["verifierAssetId"], "44".repeat(32));
+        assert_eq!(context["accountTapleafHash"].as_str().unwrap().len(), 64);
+        assert!(!account.get_script_pubkey().is_empty());
+
+        let mut invalid = request();
+        invalid.auth_script_pubkey = "51".into();
+        assert!(
+            verification(State(app.state.clone()), Json(invalid))
+                .await
+                .is_err()
+        );
+        let mut metadata = OracleAccount {
+            tick_asset_id: "33".repeat(32),
+            oracle_verifier_asset_id: "44".repeat(32),
+            storm_eye_asset_id: "55".repeat(32),
+            network: "elementsregtest".into(),
+        };
+        metadata = validate_network(&app.state, metadata).unwrap();
+        metadata.tick_asset_id = "66".repeat(32);
+        assert!(validate_network(&app.state, metadata).is_err());
+    }
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
     use simplex::simplicityhl::elements::secp256k1_zkp::{Keypair, Message, Secp256k1, SecretKey};
@@ -802,7 +1171,7 @@ mod tests {
         };
         let signed = signed_price(&signed(data), &terms(), 1100).unwrap();
         let mut tick = UTXO {
-            outpoint: OutPoint::new(Txid::all_zeros(), 2),
+            outpoint: OutPoint::new(Txid::from_byte_array([0; 32]), 2),
             txout: TxOut {
                 asset: Asset::Explicit(parse_asset(&terms().tick_asset_id, "tick").unwrap()),
                 value: Value::Explicit(1050),
@@ -838,24 +1207,19 @@ mod tests {
 
     #[tokio::test]
     async fn assembles_price_claim_and_house_sweep_psets() {
-        let app = App::new(super::super::tests::config(
-            std::env::temp_dir().join(format!("price-{}.json", Uuid::new_v4())),
-        ))
-        .await
-        .unwrap();
+        let app = App::new(super::super::tests::config()).await.unwrap();
         let market = Prediction {
             id: "77".repeat(32),
             title: "Touch".into(),
             created_at: 1000,
             deadline: 1100,
-            resolution: None,
-            price: Some(terms()),
+            price: terms(),
         };
         let payout =
             parse_script("00145555555555555555555555555555555555555555", "wallet").unwrap();
         let policy = app.state.network.policy_asset();
         let utxo = |asset, amount, script, vout| UTXO {
-            outpoint: OutPoint::new(Txid::all_zeros(), vout),
+            outpoint: OutPoint::new(Txid::from_byte_array([0; 32]), vout),
             txout: TxOut {
                 asset: Asset::Explicit(asset),
                 value: Value::Explicit(amount),
@@ -874,15 +1238,15 @@ mod tests {
         });
         let signed = signed_price(&data, &terms(), market.deadline).unwrap();
         let terms = terms();
-        for (sweep, requires_tick) in [(false, false), (false, true), (true, true)] {
-            let contract = contract(&app.state, &market, &payout, requires_tick).unwrap();
+        for sweep in [false, true] {
+            let contract = contract(&app.state, &market, &payout).unwrap();
             let destination = if sweep {
                 parse_script(&terms.house_script_pubkey, "house").unwrap()
             } else {
                 payout.clone()
             };
             let mut voucher = VoucherProgram::new(
-                &VoucherParameters {
+                VoucherParameters {
                     storm_eye_asset_id: parse_asset(&terms.storm_eye_asset_id, "storm").unwrap(),
                     auth_method: VoucherAuthMethod::Script {
                         auth_script_hash: hash_script(&destination),
@@ -910,16 +1274,9 @@ mod tests {
                     tick_input_index: 1,
                     house_output_index: 0,
                 }
-            } else if requires_tick {
+            } else {
                 PriceMarketSpend::ClaimWithTick {
                     tick_input_index: 2,
-                    verifier_input_index: 1,
-                    verifier_tapleaf_hash: voucher.get_tapleaf_hash(),
-                    signed,
-                    payout_output_index: 0,
-                }
-            } else {
-                PriceMarketSpend::Claim {
                     verifier_input_index: 1,
                     verifier_tapleaf_hash: voucher.get_tapleaf_hash(),
                     signed,
@@ -932,9 +1289,9 @@ mod tests {
                 voucher.get_script_pubkey(&app.state.network),
                 1,
             );
-            let tick = if !sweep && requires_tick {
+            let tick = if !sweep {
                 let program = VoucherProgram::new(
-                    &VoucherParameters {
+                    VoucherParameters {
                         storm_eye_asset_id: parse_asset(&terms.storm_eye_asset_id, "storm")
                             .unwrap(),
                         auth_method: VoucherAuthMethod::Script {
@@ -990,9 +1347,14 @@ mod tests {
     }
 
     #[test]
-    fn old_predictions_deserialize_without_price_terms() {
-        let prediction: Prediction = serde_json::from_value(serde_json::json!({ "id": "77".repeat(32), "title": "Legacy", "deadline": 1100, "created_at": 1000, "resolution": null })).unwrap();
-        assert!(prediction.price.is_none());
+    fn predictions_require_price_terms() {
+        assert!(
+            serde_json::from_value::<Prediction>(serde_json::json!({
+                "id": "77".repeat(32), "title": "Missing price terms",
+                "deadline": 1100, "created_at": 1000,
+            }))
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1005,21 +1367,19 @@ mod tests {
             ("liquidtestnet", true, true, false),
             ("liquid", true, false, false),
         ] {
-            let oracle = Router::new().route(
-                "/users/account/{owner}",
-                get(move || async move {
-                    Json(serde_json::json!({
-                        "network": oracle_network,
-                        "tick_asset_id": "22".repeat(32),
-                        "oracle_verifier_asset_id": "33".repeat(32),
-                        "storm_eye_asset_id": "44".repeat(32),
-                    }))
-                }),
-            );
+            let metadata = move || async move {
+                Json(serde_json::json!({
+                    "network": oracle_network,
+                    "tick_asset_id": "22".repeat(32),
+                    "oracle_verifier_asset_id": "33".repeat(32),
+                    "storm_eye_asset_id": "44".repeat(32),
+                }))
+            };
+            let oracle = Router::new()
+                .route("/users/network", get(metadata))
+                .route("/users/account/{owner}", get(metadata));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let mut config = super::super::tests::config(
-                std::env::temp_dir().join(format!("oracle-network-{}.json", Uuid::new_v4())),
-            );
+            let mut config = super::super::tests::config();
             config.oracle_url = format!("http://{}", listener.local_addr().unwrap());
             if testnet {
                 let network = SimplicityNetwork::LiquidTestnet;
@@ -1031,34 +1391,274 @@ mod tests {
             }
             let task = tokio::spawn(async move { axum::serve(listener, oracle).await.unwrap() });
             let app = App::new(config).await.unwrap();
-            let result = account(&app.state, &app.state.admin_public_key).await;
+            let result = account(&app.state, crate::tests::HOLDER_PUBLIC_KEY).await;
             assert_eq!(
                 result.is_ok(),
                 accepted,
                 "{oracle_network}, testnet={testnet}, wrong_genesis={wrong_genesis}"
             );
+            assert_eq!(network(&app.state).await.is_ok(), accepted);
             task.abort();
         }
     }
 
     #[tokio::test]
-    async fn publishes_immutable_price_terms_and_disallows_admin_resolution() {
+    async fn network_metadata_rejects_missing_or_invalid_network_endpoint() {
+        let metadata = serde_json::json!({
+            "network": "elementsregtest",
+            "tick_asset_id": "22".repeat(32),
+            "oracle_verifier_asset_id": "33".repeat(32),
+            "storm_eye_asset_id": "44".repeat(32),
+        });
+        let response = Arc::new(RwLock::new((StatusCode::NOT_FOUND, metadata.clone())));
+        let response_state = response.clone();
+        let owners = Arc::new(RwLock::new(Vec::<String>::new()));
+        let requested_owners = owners.clone();
+        let account_metadata = metadata.clone();
         let oracle = Router::new()
-            .route("/price-feeds", get(|| async { Json(serde_json::json!([{ "id": 0, "decimals": 8 }])) }))
-            .route("/users/account/{owner}", get(|| async { Json(serde_json::json!({ "network": "elementsregtest", "tick_asset_id": "22".repeat(32), "oracle_verifier_asset_id": "33".repeat(32), "storm_eye_asset_id": "44".repeat(32) })) }));
+            .route(
+                "/users/network",
+                get(move || {
+                    let response = response_state.clone();
+                    async move {
+                        let (status, metadata) = response.read().await.clone();
+                        (status, Json(metadata))
+                    }
+                }),
+            )
+            .route(
+                "/users/account/{owner}",
+                get(move |AxumPath(owner): AxumPath<String>| {
+                    let owners = requested_owners.clone();
+                    let metadata = account_metadata.clone();
+                    async move {
+                        owners.write().await.push(owner);
+                        Json(metadata)
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = super::super::tests::config();
+        config.oracle_url = format!("http://{}", listener.local_addr().unwrap());
+        let directory = std::env::temp_dir().join(format!("network-metadata-{}", Uuid::new_v4()));
+        config.escrow = Some(
+            serde_json::from_value(serde_json::json!({
+                "private_key_file": directory.join("reserve.hex"),
+                "max_stake_sats": 1000000,
+            }))
+            .unwrap(),
+        );
+        let task = tokio::spawn(async move { axum::serve(listener, oracle).await.unwrap() });
+        let app = App::new(config.clone()).await.unwrap();
+
+        assert!(network(&app.state).await.is_err());
+        assert!(owners.read().await.is_empty());
+
+        config.escrow = None;
+        let no_wallet = App::new(config).await.unwrap();
+        assert!(network(&no_wallet.state).await.is_err());
+        assert!(owners.read().await.is_empty());
+
+        for (status, body) in [
+            (StatusCode::SERVICE_UNAVAILABLE, metadata.clone()),
+            (
+                StatusCode::OK,
+                serde_json::json!({ "network": "elementsregtest" }),
+            ),
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "network": "liquidtestnet",
+                    "tick_asset_id": "22".repeat(32),
+                    "oracle_verifier_asset_id": "33".repeat(32),
+                    "storm_eye_asset_id": "44".repeat(32),
+                }),
+            ),
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "network": "elementsregtest",
+                    "tick_asset_id": "invalid",
+                    "oracle_verifier_asset_id": "33".repeat(32),
+                    "storm_eye_asset_id": "44".repeat(32),
+                }),
+            ),
+        ] {
+            *response.write().await = (status, body);
+            assert!(network(&app.state).await.is_err());
+            assert!(owners.read().await.is_empty());
+        }
+
+        *response.write().await = (StatusCode::OK, metadata);
+        assert!(network(&no_wallet.state).await.is_ok());
+        assert!(owners.read().await.is_empty());
+        task.abort();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[test]
+    fn automatic_strikes_require_one_percent_in_either_direction() {
+        assert_eq!(automatic_strike(100000, true).unwrap(), 101000);
+        assert_eq!(automatic_strike(100000, false).unwrap(), 99000);
+        assert_eq!(automatic_strike(110001, true).unwrap(), 111102);
+        assert_eq!(automatic_strike(110001, false).unwrap(), 108900);
+        assert!(automatic_strike(u64::MAX, true).is_err());
+        assert_eq!(
+            automatic_strike(u64::MAX, false).unwrap(),
+            (u128::from(u64::MAX) * 99 / 100) as u64,
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_publication_retries_and_persists_twelve_hour_slots() {
+        let latest = Arc::new(RwLock::new(serde_json::json!({ "main": null })));
+        let latest_response = latest.clone();
+        let oracle = Router::new()
+            .route(
+                "/price-feeds",
+                get(|| async { Json(serde_json::json!([{ "id": 0, "decimals": 8 }])) }),
+            )
+            .route(
+                "/price-feeds/{id}",
+                get(move || {
+                    let latest = latest_response.clone();
+                    async move { Json(latest.read().await.clone()) }
+                }),
+            )
+            .route(
+                "/users/network",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "network": "elementsregtest",
+                        "tick_asset_id": "22".repeat(32),
+                        "oracle_verifier_asset_id": "33".repeat(32),
+                        "storm_eye_asset_id": "44".repeat(32),
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let directory = std::env::temp_dir().join(format!("auto-publish-{}", Uuid::new_v4()));
+        let mut config = super::super::tests::config();
+        config.database_url = format!(
+            "sqlite://{}/predictions.sqlite3?mode=rwc",
+            directory.display()
+        );
+        config.oracle_url = format!("http://{}", listener.local_addr().unwrap());
+        config.auto_publish.enabled = true;
+        config.escrow = Some(
+            serde_json::from_value(serde_json::json!({
+                "private_key_file": directory.join("escrow-private-key.hex"),
+                "max_stake_sats": 1000000,
+            }))
+            .unwrap(),
+        );
+        let task = tokio::spawn(async move { axum::serve(listener, oracle).await.unwrap() });
+        let app = App::new(config.clone()).await.unwrap();
+        let now = 43_201;
+
+        assert!(publish_scheduled(&app.state, now).await.is_err());
+        assert!(app.state.db.list().await.unwrap().is_empty());
+        *latest.write().await = serde_json::json!({ "main": { "feed": {
+            "feed_id": 0, "price": 100000, "decimals": 8,
+            "received_at": now - 1, "valid_until": now + 300,
+        } } });
+        let (first, second) = tokio::join!(
+            publish_scheduled(&app.state, now),
+            publish_scheduled(&app.state, now),
+        );
+        assert_ne!(first.unwrap(), second.unwrap());
+        let predictions = app.state.db.list().await.unwrap();
+        assert_eq!(predictions.len(), 1);
+        let prediction = &predictions[0];
+        assert_eq!(prediction.deadline, 86_400);
+        assert_eq!(prediction.created_at, now);
+        let price = &prediction.price;
+        assert_eq!(price.strike, if price.above { "101000" } else { "99000" });
+        assert_eq!(
+            prediction.title,
+            format!(
+                "BTC/USD reaches {}1% by 00:00 UTC",
+                if price.above { "+" } else { "-" },
+            ),
+        );
+        assert_eq!(price.opens_at, now);
+        assert_eq!(price.claim_grace, 600);
+        assert_eq!(
+            price.house_script_pubkey,
+            hex::encode(
+                app.state
+                    .reserve_wallet
+                    .as_ref()
+                    .unwrap()
+                    .script_pubkey()
+                    .as_bytes(),
+            )
+        );
+
+        let restored = App::new(config.clone()).await.unwrap();
+        assert!(!publish_scheduled(&restored.state, now + 60).await.unwrap());
+        assert!(!publish_scheduled(&restored.state, 64_800).await.unwrap());
+        assert_eq!(restored.state.db.list().await.unwrap(), predictions);
+
+        assert!(publish_scheduled(&restored.state, 86_400).await.is_err());
+        assert_eq!(restored.state.db.list().await.unwrap().len(), 1);
+        *latest.write().await = serde_json::json!({ "main": { "feed": {
+            "feed_id": 0, "price": 110001, "decimals": 8,
+            "received_at": 86_400, "valid_until": 86_700,
+        } } });
+        assert!(publish_scheduled(&restored.state, 86_400).await.unwrap());
+        let predictions = restored.state.db.list().await.unwrap();
+        assert_eq!(predictions.len(), 2);
+        assert_eq!(predictions[1].deadline, 129_600);
+        let price = &predictions[1].price;
+        assert_eq!(price.strike, if price.above { "111102" } else { "108900" });
+        assert_eq!(
+            predictions[1].title,
+            format!(
+                "BTC/USD reaches {}1% by 12:00 UTC",
+                if price.above { "+" } else { "-" },
+            ),
+        );
+
+        config.auto_publish.enabled = false;
+        let disabled = App::new(config).await.unwrap();
+        assert!(!publish_scheduled(&disabled.state, 129_600).await.unwrap());
+        assert_eq!(disabled.state.db.list().await.unwrap(), predictions);
+        task.abort();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publishes_immutable_price_terms_and_disallows_admin_resolution() {
+        let metadata = || async {
+            let terms = terms();
+            Json(serde_json::json!({
+                "network": "elementsregtest",
+                "tick_asset_id": terms.tick_asset_id,
+                "oracle_verifier_asset_id": terms.verifier_asset_id,
+                "storm_eye_asset_id": terms.storm_eye_asset_id,
+            }))
+        };
+        let oracle = Router::new()
+            .route(
+                "/price-feeds",
+                get(|| async { Json(serde_json::json!([{ "id": 0, "decimals": 8 }])) }),
+            )
+            .route("/users/network", get(metadata))
+            .route("/users/account/{owner}", get(metadata));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, oracle).await.unwrap() });
-        let path = std::env::temp_dir().join(format!("price-publish-{}.json", Uuid::new_v4()));
-        let mut config = super::super::tests::config(path.clone());
+        let path = std::env::temp_dir().join(format!("price-publish-{}.sqlite3", Uuid::new_v4()));
+        let mut config = super::super::tests::config();
+        config.database_url = format!("sqlite://{}?mode=rwc", path.display());
         config.oracle_url = url;
         let app = App::new(config).await.unwrap();
         let now = unix_time().unwrap();
         app.state
-            .store
+            .sessions
             .write()
             .await
-            .sessions
             .insert("test-session".into(), now + 3600);
         let router = app.router();
         let request = |uri: &str, body: serde_json::Value| {
@@ -1071,7 +1671,7 @@ mod tests {
                 .unwrap()
         };
         let body = serde_json::json!({ "title": "Oracle touch", "deadline": now + 3600, "price": { "feed_id": 0, "strike": "10000000000", "above": true, "opens_at": now, "claim_grace": 600,
-            "house_script_pubkey": terms().house_script_pubkey, "owner_public_key": app.state.admin_public_key } });
+            "house_script_pubkey": terms().house_script_pubkey } });
         let mut invalid = body.clone();
         invalid["price"]["feed_id"] = serde_json::json!(999);
         assert_eq!(
@@ -1092,10 +1692,10 @@ mod tests {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let prediction: Prediction = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
-            prediction.price.as_ref().unwrap().verifier_asset_id,
+            prediction.price.verifier_asset_id,
             terms().verifier_asset_id
         );
-        let derive = serde_json::json!({ "payout_script_pubkey": "00145555555555555555555555555555555555555555", "tick_asset_id": "99".repeat(32), "tick_script_pubkey": "51", "confidential_payout": true, "owner_public_key": app.state.admin_public_key });
+        let derive = serde_json::json!({ "payout_script_pubkey": "00145555555555555555555555555555555555555555", "owner_public_key": crate::tests::HOLDER_PUBLIC_KEY });
         let derived = router
             .clone()
             .oneshot(request(
@@ -1108,8 +1708,15 @@ mod tests {
         let derived: serde_json::Value =
             serde_json::from_slice(&derived.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
-        assert_eq!(derived["tick_asset_id"], terms().tick_asset_id);
-        assert_eq!(derived["confidential_payout"], false);
+        let payout =
+            parse_script("00145555555555555555555555555555555555555555", "wallet").unwrap();
+        let expected = contract(&app.state, &prediction, &payout)
+            .unwrap()
+            .get_script_pubkey();
+        assert_eq!(
+            derived,
+            serde_json::json!({ "script_pubkey": hex::encode(expected.as_bytes()) })
+        );
         assert_eq!(
             router
                 .oneshot(request(
@@ -1119,10 +1726,19 @@ mod tests {
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::BAD_REQUEST
+            StatusCode::NOT_FOUND
         );
         let restored = App::new(app.state.config.clone()).await.unwrap();
-        assert_eq!(restored.state.store.read().await.predictions[0], prediction);
+        assert_eq!(
+            restored
+                .state
+                .db
+                .find(&prediction.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            prediction
+        );
         tokio::fs::remove_file(path).await.unwrap();
         task.abort();
     }
@@ -1138,13 +1754,11 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, chain).await.unwrap() });
-        let mut config = super::super::tests::config(
-            std::env::temp_dir().join(format!("price-chain-{}.json", Uuid::new_v4())),
-        );
+        let mut config = super::super::tests::config();
         config.chain_backend.esplora_url = url;
         let app = App::new(config).await.unwrap();
         let utxo = UTXO {
-            outpoint: OutPoint::new(Txid::all_zeros(), 0),
+            outpoint: OutPoint::new(Txid::from_byte_array([0; 32]), 0),
             txout: TxOut {
                 asset: Asset::Explicit(app.state.network.policy_asset()),
                 value: Value::Explicit(50000),

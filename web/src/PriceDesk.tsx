@@ -1,13 +1,14 @@
 import { useEffect, useState } from 'react'
 import { Check, Clock3, Copy, LoaderCircle, Plus, Radio, RefreshCw, ShieldCheck, WalletCards } from 'lucide-react'
 import { Pset } from 'liquidjs-lib'
-import { PriceOracleClient, createWalletTickRequest, parseExecutedTick, walletRequestSigningMessage, type PriceFeedInfo, type PriceFeedRate } from '@price-oracle/sdk'
-import { connectHumid, signHumidMessage, signAndBroadcastHumidPset, validateHumidSession, type HumidWallet } from './humid'
+import { PriceOracleClient, createWalletTickRequest, deriveAccount, parseExecutedTick, walletRequestSigningMessage, type PriceFeedInfo, type PriceFeedRate } from '@price-oracle/sdk'
+import { connectHumid, HumidNotDetectedError, signHumidMessage, signAndBroadcastHumidPset, validateHumidSession, type HumidWallet } from './humid'
+import HumidInstallDialog from './HumidInstallDialog'
 import { addWalletInputDerivation, EsploraClient } from './wallet'
-import { displayPrice, fundOracleRequest, scaledPrice, waitForOutput, type ExplicitUtxo, type PriceMarket } from './price-market'
+import { displayPrice, fundOracleRequest, loadOracleVerification, scaledPrice, verifyMarketAssets, waitForOutput, type ExplicitUtxo, type PriceMarket } from './price-market'
 import type { ServerConfig } from './App'
 
-type Market = { id: string; title: string; deadline: number; price?: PriceMarket }
+type Market = { id: string; title: string; deadline: number; price: PriceMarket }
 type ReserveStatus = { configured: boolean; funding_address: string | null; balance_sats: number; available_sats: number; reserved_sats: number; utxo_count: number; max_stake_sats: number }
 type SweepState = { marketId: string; positionOutpoint: string; payoutScript: string; feeOutpoint: string; reserve: ExplicitUtxo | null; requestHash: string; tick: ExplicitUtxo | null; txid: string }
 const KEY = 'signal-market:house-sweep:v1'
@@ -37,6 +38,7 @@ export default function PriceDesk({ token, predictions, refresh, serverApi, coor
   const [grace, setGrace] = useState(600)
   const [busy, setBusy] = useState('')
   const [notice, setNotice] = useState('')
+  const [humidInstall, setHumidInstall] = useState<{ trigger: Element | null } | null>(null)
   const [reserves, setReserves] = useState<ReserveStatus | null>(null)
   const [reservesBusy, setReservesBusy] = useState(true)
   const [reservesError, setReservesError] = useState('')
@@ -117,6 +119,7 @@ export default function PriceDesk({ token, predictions, refresh, serverApi, coor
   }
 
   async function connect() {
+    const trigger = humidInstall?.trigger ?? document.activeElement
     setBusy('connect'); setNotice('')
     try {
       const response = await fetch(`${serverApi}/api/config`)
@@ -124,7 +127,10 @@ export default function PriceDesk({ token, predictions, refresh, serverApi, coor
       const config = await response.json() as ServerConfig
       await new EsploraClient(chainBackend).validateGenesis(config.genesis_block_hash)
       setWallet(await connectHumid(config.policy_asset_id, chainBackend))
-    } catch (error) { setNotice(error instanceof Error ? error.message : 'Connection failed') }
+    } catch (error) {
+      if (error instanceof HumidNotDetectedError) setHumidInstall({ trigger })
+      else setNotice(error instanceof Error ? error.message : 'Connection failed')
+    }
     finally { setBusy('') }
   }
 
@@ -140,7 +146,7 @@ export default function PriceDesk({ token, predictions, refresh, serverApi, coor
       if (!feed) throw new Error('Select an available oracle feed')
       await api('/api/admin/predictions', { title, deadline: Math.floor(new Date(deadline).getTime() / 1000), price: {
         feed_id: feed.id, strike: scaledPrice(strike, feed.decimals), above, opens_at: Math.floor(new Date(opensAt).getTime() / 1000),
-        claim_grace: grace, house_script_pubkey: wallet.scriptPubKey, owner_public_key: wallet.publicKey.slice(2),
+        claim_grace: grace, house_script_pubkey: wallet.scriptPubKey,
       } })
       await refresh(); setTitle(''); setNotice('Price market published.')
     } catch (error) { setNotice(error instanceof Error ? error.message : 'Publication failed') }
@@ -151,8 +157,8 @@ export default function PriceDesk({ token, predictions, refresh, serverApi, coor
     let positionOutpoint = ''
     let payoutScript = ''
     try {
-      const state = JSON.parse(localStorage.getItem(userStateKey) ?? '{}') as { fundedPredictionId?: string; positionOutpoint?: string; walletScript?: string; positions?: Record<string, { positionOutpoint?: string }> }
-      const position = state.positions?.[id] ?? (state.fundedPredictionId === id ? state : undefined)
+      const state = JSON.parse(localStorage.getItem(userStateKey) ?? '{}') as { walletScript?: string; positions?: Record<string, { positionOutpoint?: string }> }
+      const position = state.positions?.[id]
       if (position) { positionOutpoint = position.positionOutpoint ?? ''; payoutScript = state.walletScript ?? '' }
     } catch {}
     setSweep({ ...emptySweep, marketId: id, positionOutpoint, payoutScript })
@@ -165,11 +171,13 @@ export default function PriceDesk({ token, predictions, refresh, serverApi, coor
       if (!market?.price || !expired || wallet.scriptPubKey !== market.price.house_script_pubkey) throw new Error('Sweep requires the published house wallet and an expired claim-priority period')
       const client = new PriceOracleClient(coordinatorApi)
       const chain = new EsploraClient(chainBackend)
+      const verification = await loadOracleVerification(serverApi, wallet, config.network)
+      verifyMarketAssets(market.price, verification)
       let requestHash = sweep.requestHash
       if (!requestHash) {
         let feeOutpoint = sweep.feeOutpoint
         if (!feeOutpoint) {
-          const account = await client.getAccount(wallet.publicKey.slice(2), wallet.scriptPubKey)
+          const account = await client.getAccount(wallet.publicKey.slice(2), verification)
           const funding = await fundOracleRequest(wallet, account, chainBackend)
           feeOutpoint = funding.feeOutpoint
           setSweep((state) => ({ ...state, feeOutpoint, reserve: funding.reserve }))
@@ -188,7 +196,7 @@ export default function PriceDesk({ token, predictions, refresh, serverApi, coor
         const result = executed?.results.find((item) => item.kind === 'tick-utxo')
         if (executed && result) {
           const tick = await waitForOutput(chain, executed.txid, result.vout)
-          if (tick.asset !== market.price.tick_asset_id || tick.amount_sats <= market.deadline + market.price.claim_grace) throw new Error('Tick does not prove expiry')
+          if (tick.asset !== verification.tickAssetId || tick.script_pubkey !== deriveAccount(verification).tick_script_pubkey || tick.amount_sats <= market.deadline + market.price.claim_grace) throw new Error('Tick does not prove expiry')
           setSweep((state) => ({ ...state, tick })); setNotice('Expiry Tick ready.'); return
         }
         await new Promise((resolve) => window.setTimeout(resolve, 1000))
@@ -221,6 +229,7 @@ export default function PriceDesk({ token, predictions, refresh, serverApi, coor
   }
 
   return <>
+    {humidInstall && <HumidInstallDialog returnFocus={humidInstall.trigger} onClose={() => setHumidInstall(null)} onRetry={() => { setHumidInstall(null); void connect() }} />}
     <section className="escrow-reserves" aria-label="Escrow reserves">
       <div className="section-heading"><div><span className="eyebrow">Backend wallet</span><h2>Escrow reserves</h2></div><button type="button" className="icon-button" title="Refresh escrow reserves" onClick={refreshReserves} disabled={reservesBusy}>{reservesBusy ? <LoaderCircle className="spin" size={17} /> : <RefreshCw size={17} />}</button></div>
       {reserves?.configured && reserves.funding_address ? <>
@@ -256,7 +265,7 @@ export default function PriceDesk({ token, predictions, refresh, serverApi, coor
     <section className="price-sweep" aria-label="House sweep">
       <div className="section-heading"><h2>Expired price positions</h2><Clock3 size={17} /></div>
       <div className="sweep-fields">
-        <label>Market<select value={sweep.marketId} disabled={Boolean(busy)} onChange={(event) => chooseMarket(event.target.value)}><option value="">Select market</option>{predictions.filter((item) => item.price).map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label>
+        <label>Market<select value={sweep.marketId} disabled={Boolean(busy)} onChange={(event) => chooseMarket(event.target.value)}><option value="">Select market</option>{predictions.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label>
         <label>Position outpoint<input value={sweep.positionOutpoint} disabled={Boolean(busy)} onChange={(event) => setSweep({ ...sweep, positionOutpoint: event.target.value })} placeholder="txid:vout" /></label>
         <label>Holder payout script<input value={sweep.payoutScript} disabled={Boolean(busy)} onChange={(event) => setSweep({ ...sweep, payoutScript: event.target.value })} /></label>
       </div>

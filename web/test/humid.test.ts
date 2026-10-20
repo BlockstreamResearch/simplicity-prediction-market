@@ -4,6 +4,7 @@ import * as ecc from "@bitcoinerlab/secp256k1";
 import { networks } from "liquidjs-lib";
 import {
   connectHumid,
+  HumidNotDetectedError,
   deriveHumidWallet,
   descriptorChecksum,
   getHumidUtxos,
@@ -39,6 +40,16 @@ const descriptor: WalletDescriptor = {
   ],
 };
 const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+test("Humid installation is required only when the provider is not detected", async () => {
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { setTimeout },
+  });
+  await expect(connectHumid(policyAsset)).rejects.toBeInstanceOf(
+    HumidNotDetectedError,
+  );
+});
+
 test("Humid signs a joint escrow without broadcasting or signing host inputs", async () => {
   const wallet = deriveHumidWallet(descriptor);
   let signing: unknown;

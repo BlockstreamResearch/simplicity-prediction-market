@@ -13,10 +13,11 @@ hex = "0.4"
 http-body-util = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 secp256k1 = { version = "0.31", features = ["rand"] }
-simplex = { package = "smplx-std", version = "0.0.12" }
+simplex = { package = "smplx-std", version = "0.1.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["any", "macros", "migrate", "postgres", "sqlite", "runtime-tokio"] }
 subtle = "2.6"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }

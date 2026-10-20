@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
+import { deriveAccount, type AccountVerification } from "@price-oracle/sdk";
 import * as ecc from "@bitcoinerlab/secp256k1";
 import {
   Creator,
+  bip341,
   CreatorInput,
   CreatorOutput,
   ElementsValue,
@@ -13,7 +15,32 @@ import {
   Transaction,
 } from "liquidjs-lib";
 
+async function mockOracleVerification(
+  page: Page,
+  stormTreeRoot = "77".repeat(32),
+) {
+  let context: AccountVerification;
+  await page.route("**/api/oracle/verification", (route) => {
+    const request = route.request().postDataJSON();
+    context = {
+      ownerPublicKey: request.owner_public_key,
+      authScriptPubKey: request.auth_script_pubkey,
+      network: "elementsregtest",
+      stormEyeAssetId: "44".repeat(32),
+      tickAssetId: "22".repeat(32),
+      verifierAssetId: "33".repeat(32),
+      accountTapleafHash: "aa".repeat(32),
+      tickTapleafHash: "bb".repeat(32),
+    };
+    return route.fulfill({ json: { ...context, stormTreeRoot } });
+  });
+  await page.route("**/users/account/**", (route) =>
+    route.fulfill({ json: deriveAccount(context) }),
+  );
+}
+
 test.beforeEach(async ({ page }) => {
+  await mockOracleVerification(page);
   await page.route("**/api/admin/escrow", (route) =>
     route.fulfill({
       json: {
@@ -40,6 +67,105 @@ test.beforeEach(async ({ page }) => {
     }),
   );
 });
+
+for (const viewport of [
+  { width: 1440, height: 1000 },
+  { width: 375, height: 667 },
+]) {
+  test(`missing Humid opens a responsive installation guide at ${viewport.width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize(viewport);
+    await page.route("**/api/predictions", (route) =>
+      route.fulfill({ json: [] }),
+    );
+    await page.route("**/api/prices", (route) => route.fulfill({ json: [] }));
+    await page.route("**/api/chain/block-height/0", (route) =>
+      route.fulfill({
+        body: "cd179c84c35f51825f20a3b91a18d45f0c53b5ceb744a5b6ef8f0babe809396f",
+      }),
+    );
+    await page.addInitScript(() => {
+      delete window.humid;
+      sessionStorage.setItem("admin-token", "fixture-token");
+    });
+    await page.goto("/");
+    const connect = page
+      .getByRole("region", { name: "Wallet summary" })
+      .getByRole("button", { name: "Connect Humid", exact: true });
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await connect.click();
+
+    const dialog = page.getByRole("dialog", { name: "Install Humid" });
+    await expect(dialog).toBeVisible();
+    await expect(
+      dialog.getByText("Developer mode", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      dialog.getByText("Load unpacked", { exact: true }),
+    ).toBeVisible();
+    await expect(
+      dialog.getByRole("link", { name: "chrome://extensions", exact: true }),
+    ).toHaveAttribute("href", "chrome://extensions");
+    await expect(
+      dialog.getByRole("link", { name: "Download Humid" }),
+    ).toHaveAttribute(
+      "href",
+      "https://github.com/BlockstreamResearch/humid/releases/download/1.1.3/humid-extension-1.1.3.zip",
+    );
+    await expect(dialog.getByRole("button", { name: "Try again" })).toHaveCSS(
+      "margin-top",
+      "0px",
+    );
+    await expect(dialog.getByRole("button", { name: "Try again" })).toHaveCSS(
+      "min-height",
+      "40px",
+    );
+    const bounds = await dialog.boundingBox();
+    expect(bounds!.x).toBeGreaterThanOrEqual(0);
+    expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(viewport.width);
+    expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(viewport.height);
+    const close = dialog.getByRole("button", {
+      name: "Close installation guide",
+    });
+    await expect(close).toBeFocused();
+    await page.keyboard.press("Shift+Tab");
+    await expect(
+      dialog.getByRole("button", { name: "Try again" }),
+    ).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(close).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
+    await expect(connect).toBeFocused();
+
+    await connect.click();
+    await expect(dialog).toBeVisible();
+    await page.evaluate(() => {
+      window.humid = {
+        request: async () => {
+          throw new Error("Humid approval rejected");
+        },
+      };
+    });
+    await dialog.getByRole("button", { name: "Try again" }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByRole("alert")).toContainText(
+      "Humid approval rejected",
+    );
+
+    await page.evaluate(() => {
+      delete window.humid;
+    });
+    await page.getByRole("button", { name: "Demo", exact: true }).click();
+    await page.getByRole("button", { name: "Connect house Humid" }).click();
+    await expect(dialog).toBeVisible();
+    await dialog
+      .getByRole("button", { name: "Close installation guide" })
+      .click();
+    await expect(dialog).toHaveCount(0);
+  });
+}
 
 test("admin escrow wallet shows a copyable funding address and refreshes reserve balances", async ({
   page,
@@ -82,6 +208,16 @@ test("admin escrow wallet shows a copyable funding address and refreshes reserve
   );
   await page.goto("/");
   await page.getByRole("button", { name: "Demo", exact: true }).click();
+  const publishing = page.getByRole("region", {
+    name: "Price market publishing",
+  });
+  await expect(
+    publishing.getByRole("button", { name: "Publish price market" }),
+  ).toHaveCSS("background-color", "rgb(39, 6, 207)");
+  await expect(publishing.getByLabel("Feed", { exact: true })).toHaveCSS(
+    "font-family",
+    "Inter, sans-serif",
+  );
   const reserves = page.getByRole("region", {
     name: "Escrow reserves",
     exact: true,
@@ -135,7 +271,16 @@ test("admin escrow wallet shows a copyable funding address and refreshes reserve
     .getByRole("button", { name: "Refresh escrow reserves" })
     .click();
   await expect(reserves.getByRole("alert")).toHaveCount(0);
-  for (const width of [1440, 390]) {
+  await publishing
+    .getByRole("button", { name: "At or below", exact: true })
+    .click();
+  await expect(
+    publishing.getByRole("button", { name: "At or below", exact: true }),
+  ).toHaveAttribute("aria-pressed", "true");
+  await expect(
+    publishing.getByRole("button", { name: "At or below", exact: true }),
+  ).toHaveCSS("background-color", "rgb(255, 255, 255)");
+  for (const width of [1440, 390, 375]) {
     await page.setViewportSize({ width, height: 1000 });
     await expect(
       reserves.getByText(fundingAddress, { exact: true }),
@@ -150,6 +295,33 @@ test("admin escrow wallet shows a copyable funding address and refreshes reserve
       fullPage: true,
     });
   }
+  await page.getByRole("button", { name: "Sign out", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "Operator access" }),
+  ).toBeVisible();
+  const signIn = page.getByRole("button", { name: "Sign in", exact: true });
+  await expect(signIn).toHaveCSS("background-color", "rgb(39, 6, 207)");
+  for (const width of [1440, 375]) {
+    await page.setViewportSize({ width, height: 900 });
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= window.innerWidth,
+      ),
+    ).toBe(true);
+    await page.screenshot({
+      path: `test-results/admin-login-${width}.png`,
+      fullPage: true,
+    });
+  }
+  await page.route("**/api/admin/login", (route) =>
+    route.fulfill({ json: { token: "fixture-token" } }),
+  );
+  await page.getByLabel("Login", { exact: true }).fill("operator");
+  await page.getByLabel("Password", { exact: true }).fill("fixture-password");
+  await signIn.click();
+  await expect(
+    page.getByRole("heading", { name: "Market desk" }),
+  ).toBeVisible();
 });
 
 test("Liquid testnet isolates regtest positions and disables unsupported host matching", async ({
@@ -158,13 +330,14 @@ test("Liquid testnet isolates regtest positions and disables unsupported host ma
   const genesis =
     "a771da8e52ee6ad581ed1e9a99825e5b3b7992225534eaa2ae23244fe26ab1c1";
   const now = Math.floor(Date.now() / 1000);
-  const legacy = JSON.stringify({
+  const regtestState = JSON.stringify({
     selected: "regtest-market",
     stake: "0.002",
-    fundedPredictionId: "regtest-market",
-    positionOutpoint: `${"11".repeat(32)}:0`,
+    positions: {
+      "regtest-market": { positionOutpoint: `${"11".repeat(32)}:0` },
+    },
   });
-  const legacySweep = JSON.stringify({
+  const regtestSweep = JSON.stringify({
     marketId: "regtest-market",
     positionOutpoint: `${"11".repeat(32)}:0`,
   });
@@ -187,7 +360,14 @@ test("Liquid testnet isolates regtest positions and disables unsupported host ma
           title: "Testnet market",
           deadline: now + 3600,
           created_at: now,
-          resolution: null,
+          price: {
+            feed_id: 0,
+            decimals: 8,
+            strike: "10000000000",
+            above: true,
+            opens_at: now - 60,
+            claim_grace: 600,
+          },
         },
       ],
     }),
@@ -230,12 +410,12 @@ test("Liquid testnet isolates regtest positions and disables unsupported host ma
     }),
   );
   await page.addInitScript(
-    ({ legacy, legacySweep }) => {
-      localStorage.setItem("signal-market:user-state:v3", legacy);
-      localStorage.setItem("signal-market:house-sweep:v1", legacySweep);
+    ({ regtestState, regtestSweep }) => {
+      localStorage.setItem("signal-market:user-state:v3", regtestState);
+      localStorage.setItem("signal-market:house-sweep:v1", regtestSweep);
       sessionStorage.setItem("admin-token", "fixture-token");
     },
-    { legacy, legacySweep },
+    { regtestState, regtestSweep },
   );
 
   await page.goto("/");
@@ -263,12 +443,12 @@ test("Liquid testnet isolates regtest positions and disables unsupported host ma
     await page.evaluate(() =>
       localStorage.getItem("signal-market:user-state:v3"),
     ),
-  ).toBe(legacy);
+  ).toBe(regtestState);
   expect(
     await page.evaluate(() =>
       localStorage.getItem("signal-market:house-sweep:v1"),
     ),
-  ).toBe(legacySweep);
+  ).toBe(regtestSweep);
   const testnetState = await page.evaluate(
     (genesis) =>
       JSON.parse(
@@ -276,7 +456,7 @@ test("Liquid testnet isolates regtest positions and disables unsupported host ma
       ),
     genesis,
   );
-  expect(testnetState.fundedPredictionId).toBe("");
+  expect(testnetState.positions).toEqual({});
 });
 
 test("new positions lock a host-matched escrow and sign only holder inputs", async ({
@@ -306,7 +486,6 @@ test("new positions lock a host-matched escrow and sign only holder inputs", asy
     title: "Matched price position",
     deadline: now + 3600,
     created_at: now,
-    resolution: null,
     price: {
       feed_id: 0,
       decimals: 8,
@@ -354,6 +533,10 @@ test("new positions lock a host-matched escrow and sign only holder inputs", asy
   );
   await page.route("**/api/chain/**", (route) => {
     const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/block-height/0"))
+      return route.fulfill({
+        body: "cd179c84c35f51825f20a3b91a18d45f0c53b5ceb744a5b6ef8f0babe809396f",
+      });
     if (path.endsWith(`/tx/${holderTxid}/hex`))
       return route.fulfill({ body: holderTransaction.toHex() });
     return route.fulfill({
@@ -369,8 +552,6 @@ test("new positions lock a host-matched escrow and sign only holder inputs", asy
       json: {
         script_pubkey: "5120" + "99".repeat(32),
         tick_asset_id: market.price.tick_asset_id,
-        tick_script_pubkey: "51",
-        confidential_payout: false,
       },
     }),
   );
@@ -540,9 +721,9 @@ test("new positions lock a host-matched escrow and sign only holder inputs", asy
   const state = await page.evaluate(() =>
     JSON.parse(localStorage.getItem("signal-market:user-state:v3")!),
   );
-  expect(state.positionUtxo.amount_sats).toBe(200000);
-  expect(state.positionUtxo.stake_sats).toBe(100000);
-  expect(state.feeOutpoint).toBe(`${fundingTxid}:1`);
+  expect(state.positions[market.id].positionUtxo.amount_sats).toBe(200000);
+  expect(state.positions[market.id].positionUtxo.stake_sats).toBe(100000);
+  expect(state.positions[market.id].feeOutpoint).toBe(`${fundingTxid}:1`);
   await expect(page.locator(".order-panel")).toContainText("0.00200000 LBTC");
   for (const width of [1440, 390]) {
     await page.setViewportSize({ width, height: 1000 });
@@ -600,7 +781,6 @@ test("price proof survives reload, resumes once and signs only the wallet fee in
     title: "Will LBTC/USD reach 100?",
     created_at: now,
     deadline: now + 3600,
-    resolution: null,
     price: terms,
   };
   const position = {
@@ -632,9 +812,21 @@ test("price proof survives reload, resumes once and signs only the wallet fee in
     storm_tree_bloom: {
       branch: publicKey.subarray(1).toString("hex"),
       signature: Buffer.from(ecc.signSchnorr(message, secret)).toString("hex"),
-      proof: [],
+      proof: [{ right: false, hash: "99".repeat(32) }],
     },
   };
+  const branchLeaf = createHash("sha256")
+    .update(Buffer.concat([publicKey.subarray(1), Buffer.from([1])]))
+    .digest();
+  const root = createHash("sha256")
+    .update(Buffer.concat([branchLeaf, Buffer.alloc(32, 0x99)]))
+    .digest("hex");
+  await mockOracleVerification(page, root);
+  const voucherScript = (branch: Buffer) =>
+    bip341
+      .BIP341Factory(ecc)
+      .taprootOutputScript(branch, { hash: Buffer.alloc(32, 0xbb) })
+      .toString("hex");
   const pset = Creator.newPset({
     inputs: [
       new CreatorInput(txid, 0),
@@ -712,6 +904,10 @@ test("price proof survives reload, resumes once and signs only the wallet fee in
   );
   await page.route("**/api/chain/**", (route) => {
     const path = new URL(route.request().url()).pathname;
+    if (path.endsWith("/block-height/0"))
+      return route.fulfill({
+        body: "cd179c84c35f51825f20a3b91a18d45f0c53b5ceb744a5b6ef8f0babe809396f",
+      });
     if (
       path.endsWith("/outspend/0") ||
       path.endsWith("/outspend/1") ||
@@ -735,12 +931,17 @@ test("price proof survives reload, resumes once and signs only the wallet fee in
               {
                 value: 1,
                 asset: verifier,
-                scriptpubkey: "5120" + "55".repeat(32),
+                scriptpubkey: voucherScript(publicKey),
               },
               {
                 value: tickTime,
                 asset: terms.tick_asset_id,
-                scriptpubkey: "5120" + "66".repeat(32),
+                scriptpubkey: voucherScript(
+                  Buffer.from(
+                    "0250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
+                    "hex",
+                  ),
+                ),
               },
             ]
           : [
@@ -843,12 +1044,15 @@ test("price proof survives reload, resumes once and signs only the wallet fee in
               storm_eye_asset_id: market.price.storm_eye_asset_id,
             },
             selected: market.id,
-            fundedPredictionId: market.id,
-            positionOutpoint: `${txid}:0`,
-            positionUtxo: position,
-            positionConfirmations: 1,
-            redemptionFeeUtxo: fee,
-            feeOutpoint: `${txid}:1`,
+            positions: {
+              [market.id]: {
+                positionOutpoint: `${txid}:0`,
+                positionUtxo: position,
+                positionConfirmations: 1,
+                redemptionFeeUtxo: fee,
+                feeOutpoint: `${txid}:1`,
+              },
+            },
           }),
         );
       const bridge = window as unknown as {
@@ -887,10 +1091,11 @@ test("price proof survives reload, resumes once and signs only the wallet fee in
   await expect
     .poll(() =>
       page.evaluate(
-        () =>
+        (id) =>
           JSON.parse(
             localStorage.getItem("signal-market:user-state:v3") ?? "{}",
-          ).priceRequestHash,
+          ).positions[id].priceRequestHash,
+        market.id,
       ),
     )
     .toBe("99".repeat(32));
@@ -917,7 +1122,7 @@ test("price proof survives reload, resumes once and signs only the wallet fee in
   executed = true;
   await page.getByRole("button", { name: "Check price request" }).click();
   await expect(page.getByRole("alert")).toContainText(
-    "Tick is outside the signed price validity plus 55 minutes",
+    "Issued Verifier and Tick do not match the trusted context",
   );
   await expect(
     page.getByRole("button", { name: "Sign and claim" }),
@@ -979,6 +1184,61 @@ test("price proof survives reload, resumes once and signs only the wallet fee in
   ).toBeUndefined();
 });
 
+test("price markets filter closed and scheduled markets by deadline", async ({
+  page,
+}) => {
+  const now = Math.floor(Date.now() / 1000);
+  const price = {
+    feed_id: 0,
+    decimals: 8,
+    strike: "10000000000",
+    above: true,
+    opens_at: now - 7200,
+    claim_grace: 600,
+  };
+  await page.route("**/api/predictions", (route) =>
+    route.fulfill({
+      json: [
+        {
+          id: "open",
+          title: "Open oracle market",
+          deadline: now + 3600,
+          created_at: now,
+          price,
+        },
+        {
+          id: "closed",
+          title: "Closed oracle market",
+          deadline: now - 3600,
+          created_at: now,
+          price,
+        },
+        {
+          id: "scheduled",
+          title: "Scheduled oracle market",
+          deadline: now + 7200,
+          created_at: now,
+          price: { ...price, opens_at: now + 3600 },
+        },
+      ],
+    }),
+  );
+  await page.route("**/api/prices", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/prices/0", (route) =>
+    route.fulfill({ status: 503, json: { error: "Unavailable" } }),
+  );
+  await page.goto("/");
+  await expect(page.locator(".market-row")).toHaveCount(3);
+  await page.getByRole("tab", { name: "Closed", exact: true }).click();
+  await expect(page.locator(".market-row")).toHaveCount(1);
+  await expect(page.locator(".market-row")).toContainText(
+    "Closed oracle market",
+  );
+  await page.getByRole("tab", { name: "Open", exact: true }).click();
+  await expect(page.locator(".market-row")).toHaveCount(1);
+  await expect(page.locator(".market-row")).toContainText("Open oracle market");
+});
+
 test("price desk controls fit desktop and mobile and never offer admin resolution", async ({
   page,
 }, testInfo) => {
@@ -1033,7 +1293,6 @@ test("price desk controls fit desktop and mobile and never offer admin resolutio
           title: "Oracle touch",
           deadline: 2000000000,
           created_at: 1700000000,
-          resolution: null,
           price: {
             feed_id: 0,
             decimals: 8,
@@ -1053,6 +1312,12 @@ test("price desk controls fit desktop and mobile and never offer admin resolutio
   await expect(page.getByRole("button", { name: "Resolve Yes" })).toHaveCount(
     0,
   );
+  await expect(page.getByText("New event market", { exact: true })).toHaveCount(
+    0,
+  );
+  await expect(
+    page.getByRole("button", { name: "Publish prediction", exact: true }),
+  ).toHaveCount(0);
   await expect(
     page.getByRole("combobox", { name: "Feed", exact: true }),
   ).toHaveValue("0");

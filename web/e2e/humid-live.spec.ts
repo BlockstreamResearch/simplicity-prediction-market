@@ -74,10 +74,10 @@ async function finishOracle(hash: string) {
 }
 
 async function publicState(page: Page) {
-  return page.evaluate(
-    (key) => JSON.parse(localStorage.getItem(key) ?? "{}"),
-    stateKey,
-  );
+  return page.evaluate((key) => {
+    const state = JSON.parse(localStorage.getItem(key) ?? "{}");
+    return { ...state, ...state.positions?.[state.selected] };
+  }, stateKey);
 }
 
 test.use({ screenshot: "off", trace: "off", video: "off" });
@@ -325,7 +325,7 @@ test("claims and sweeps price markets with the actual Humid extension", async ()
         .getByRole("button", { name: "Publish price market", exact: true })
         .click();
       await expect(
-        app.locator(".resolution-row").filter({ hasText: title }),
+        app.getByText("Price market published.", { exact: true }),
       ).toBeVisible();
     };
     const lock = async (title: string) => {

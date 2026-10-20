@@ -1,0 +1,31 @@
+listen_address = "0.0.0.0:3100"
+database_url = "postgres://prediction-demo:prediction-demo@postgres:5432/prediction-demo"
+database_max_connections = 5
+admin_login = "admin"
+admin_password = "prediction-demo"
+policy_asset_id = "144c654344aa716d6f3abcc1ca90e5641e4e2a7f633bc09fe3baf64585819a49"
+genesis_block_hash = "a771da8e52ee6ad581ed1e9a99825e5b3b7992225534eaa2ae23244fe26ab1c1"
+session_lifetime_seconds = 3600
+oracle_url = "https://api.oracle-0.dev.blockstream.com"
+trust_coordinator = true
+
+# For independent pinning, set trust_coordinator = false and configure verified anchors instead.
+# [oracle_verification]
+# storm_eye_asset_id = "<64-hex Storm Eye asset ID>"
+# tick_asset_id = "<64-hex Tick asset ID>"
+# verifier_asset_id = "<64-hex Verifier asset ID>"
+# storm_tree_root = "<64-hex current Storm Eye root>"
+
+[auto_publish]
+enabled = true
+feed_id = 0
+
+[chain_backend]
+esplora_url = "https://blockstream.info/liquidtestnet/api"
+rpc_url = ""
+rpc_username = ""
+rpc_password = ""
+
+[escrow]
+private_key_file = "/var/lib/prediction-demo/escrow-private-key.hex"
+max_stake_sats = 1000000

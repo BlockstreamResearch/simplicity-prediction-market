@@ -79,11 +79,11 @@ async function mine() {
 async function walletState(page: Page) {
   return page.evaluate((key) => {
     const state = JSON.parse(localStorage.getItem(key) ?? "{}");
+    const position = state.positions?.[state.selected] ?? {};
     return {
-      positionOutpoint: state.positionOutpoint as string,
-      redemptionTxid: state.redemptionTxid as string,
-      redemptionConfirmations: state.redemptionConfirmations as number,
-      tickTxid: state.tick?.txid as string | undefined,
+      positionOutpoint: position.positionOutpoint as string,
+      redemptionTxid: position.redemptionTxid as string,
+      redemptionConfirmations: position.redemptionConfirmations as number,
     };
   }, stateKey);
 }
@@ -110,7 +110,7 @@ test("local datetime values round-trip through browser inputs", async ({
   }
 });
 
-test("restored legacy Humid sessions require backend approval without losing the position", async ({
+test("restored Humid sessions require backend approval without losing the position", async ({
   page,
 }) => {
   const root = BIP32Factory(ecc).fromSeed(
@@ -124,7 +124,7 @@ test("restored legacy Humid sessions require backend approval without losing the
     network: networks.regtest,
   });
   const wallet = {
-    chainId: "legacy-regtest",
+    chainId: "fixture-regtest",
     accountIdentifier: "disposable-account",
     policyAssetId: "66".repeat(32),
     address: payment.address!,
@@ -134,7 +134,22 @@ test("restored legacy Humid sessions require backend approval without losing the
     derivationPath: "m/84'/1'/0'/0/0",
   };
   const txid = "ab".repeat(32);
-  const tickTxid = "cd".repeat(32);
+  await page.route("**/api/config", (route) =>
+    route.fulfill({
+      json: {
+        policy_asset_id: wallet.policyAssetId,
+        genesis_block_hash:
+          "cd179c84c35f51825f20a3b91a18d45f0c53b5ceb744a5b6ef8f0babe809396f",
+        network: "elementsregtest",
+        oracle_url: "http://127.0.0.1:9100",
+        matched_escrow_enabled: true,
+      },
+    }),
+  );
+  await page.route("**/api/prices", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/prices/0", (route) =>
+    route.fulfill({ status: 503, json: { error: "Unavailable" } }),
+  );
   await page.route("**/api/predictions", (route) =>
     route.fulfill({
       json: [
@@ -143,31 +158,45 @@ test("restored legacy Humid sessions require backend approval without losing the
           title: "Saved position",
           deadline: 2_000_000_000,
           created_at: 1_790_000_000,
-          resolution: null,
+          price: {
+            feed_id: 0,
+            decimals: 8,
+            strike: "10000000000",
+            above: true,
+            opens_at: 1_790_000_000,
+            claim_grace: 600,
+            house_script_pubkey: wallet.scriptPubKey,
+            tick_asset_id: "22".repeat(32),
+            verifier_asset_id: "33".repeat(32),
+            storm_eye_asset_id: "44".repeat(32),
+          },
         },
       ],
     }),
   );
   await page.addInitScript(
-    ({ wallet, txid, tickTxid, stateKey }) => {
+    ({ wallet, txid, stateKey }) => {
       if (!localStorage.getItem(stateKey)) {
         localStorage.setItem("storm-humid-regtest-chain", wallet.chainId);
         localStorage.setItem(
           stateKey,
           JSON.stringify({
             wallet,
+            walletScript: wallet.scriptPubKey,
             selected: "saved-position",
-            fundedPredictionId: "saved-position",
-            positionOutpoint: `${txid}:0`,
-            positionConfirmations: 1,
-            positionUtxo: {
-              txid,
-              vout: 0,
-              amount_sats: 100_000,
-              asset: wallet.policyAssetId,
-              script_pubkey: wallet.scriptPubKey,
+            positions: {
+              "saved-position": {
+                positionOutpoint: `${txid}:0`,
+                positionConfirmations: 1,
+                positionUtxo: {
+                  txid,
+                  vout: 0,
+                  amount_sats: 100_000,
+                  asset: wallet.policyAssetId,
+                  script_pubkey: wallet.scriptPubKey,
+                },
+              },
             },
-            tick: { txid: tickTxid, vout: 0, timestamp: 1_790_000_000 },
           }),
         );
       }
@@ -194,7 +223,7 @@ test("restored legacy Humid sessions require backend approval without losing the
         },
       });
     },
-    { wallet, txid, tickTxid, stateKey },
+    { wallet, txid, stateKey },
   );
   await page.goto(process.env.VITE_TEST_URL ?? "http://127.0.0.1:5173", {
     waitUntil: "networkidle",
@@ -205,15 +234,15 @@ test("restored legacy Humid sessions require backend approval without losing the
   await expect(connect).toBeVisible();
   await expect
     .poll(() => walletState(page))
-    .toMatchObject({ positionOutpoint: `${txid}:0`, tickTxid });
+    .toMatchObject({ positionOutpoint: `${txid}:0` });
   await page.reload({ waitUntil: "networkidle" });
   await expect(connect).toBeVisible();
   await expect
     .poll(() => walletState(page))
-    .toMatchObject({ positionOutpoint: `${txid}:0`, tickTxid });
+    .toMatchObject({ positionOutpoint: `${txid}:0` });
 });
 
-test("settles event and oracle price markets through Humid with fragmented wallet outputs", async ({
+test("claims and sweeps oracle price markets through Humid", async ({
   page,
 }, testInfo) => {
   test.setTimeout(600_000);
@@ -496,11 +525,6 @@ test("settles event and oracle price markets through Humid with fragmented walle
   await mine();
 
   const unique = Date.now();
-  const titles = [
-    `Will the first checkpoint complete? ${unique}`,
-    `Will the second checkpoint complete? ${unique}`,
-  ];
-  const deadline = localDate(Date.now() + 60 * 60 * 1000);
   await page.goto("/");
   await page.getByRole("button", { name: "Demo", exact: true }).click();
   await page
@@ -513,189 +537,10 @@ test("settles event and oracle price markets through Humid with fragmented walle
   await expect(
     page.getByRole("heading", { name: "Market desk", exact: true }),
   ).toBeVisible();
-  for (const title of titles) {
-    const eventForm = page.locator(".admin-create:not(.price-desk)");
-    await eventForm.getByLabel("Question", { exact: true }).fill(title);
-    await eventForm.getByLabel("Deadline", { exact: true }).fill(deadline);
-    await page
-      .getByRole("button", { name: "Publish prediction", exact: true })
-      .click();
-    await expect(
-      page.locator(".resolution-row").filter({ hasText: title }),
-    ).toBeVisible();
-  }
-
-  await page
-    .getByRole("button", { name: "Back to Markets", exact: true })
-    .click();
-  await page
-    .getByRole("region", { name: "Wallet summary" })
-    .getByRole("button", { name: "Connect Humid", exact: true })
-    .click();
   await expect(page.getByLabel("Public RPC", { exact: true })).toHaveCount(0);
   await expect(page.getByLabel("RPC user", { exact: true })).toHaveCount(0);
   await expect(page.getByLabel("RPC password", { exact: true })).toHaveCount(0);
   await expect(page.getByLabel("Private key", { exact: true })).toHaveCount(0);
-  await expect(
-    page
-      .getByRole("region", { name: "Wallet summary" })
-      .getByRole("button", { name: "Connect Humid", exact: true }),
-  ).toHaveCount(0);
-  const settlements: string[] = [];
-
-  for (const title of titles) {
-    await page.locator(".market-row").filter({ hasText: title }).click();
-    await page
-      .getByLabel("Stake, LBTC", { exact: true })
-      .fill(settlements.length ? "0.002" : "0.001");
-    const previousOutpoint = (await walletState(page)).positionOutpoint ?? "";
-    await page
-      .getByRole("button", { name: "Participate", exact: true })
-      .click();
-    if (settlements.length === 0) {
-      await expect(page.getByRole("alert")).toContainText(
-        "Humid approval rejected",
-      );
-      expect((await walletState(page)).positionOutpoint ?? "").toBe(
-        previousOutpoint,
-      );
-      await page
-        .getByRole("button", { name: "Participate", exact: true })
-        .click();
-    }
-    await expect
-      .poll(async () => (await walletState(page)).positionOutpoint ?? "")
-      .not.toBe(previousOutpoint);
-    const funded = await walletState(page);
-    const fundingTxid = funded.positionOutpoint.split(":")[0];
-    if (settlements.length) {
-      const transaction = await rpc<{
-        vin: Array<{ txid: string; vout: number }>;
-      }>("getrawtransaction", [fundingTxid, true]);
-      expect(transaction.vin).toHaveLength(3);
-      const holderInputs = transaction.vin.slice(0, -1);
-      expect(holderInputs.every((input) => input.txid === settlements[0])).toBe(
-        true,
-      );
-      expect(holderInputs.map((input) => input.vout).sort()).toEqual([0, 2]);
-    }
-    await mine();
-    await expect(
-      page.locator(".stage.done").filter({ hasText: "Position funded" }),
-    ).toBeVisible();
-
-    await page
-      .getByRole("button", { name: "Market desk", exact: true })
-      .click();
-    const row = page.locator(".resolution-row").filter({ hasText: title });
-    await row.getByRole("textbox").fill(localDate(Date.now() - 10_000));
-    await row.getByRole("button", { name: "Resolve Yes", exact: true }).click();
-    await expect(row.locator(".signed")).toBeVisible();
-    await page
-      .getByRole("button", { name: "Back to Markets", exact: true })
-      .click();
-    await page
-      .getByRole("button", { name: "Request winning Tick", exact: true })
-      .click();
-    await expect(
-      page.getByRole("button", { name: "Sign and redeem", exact: true }),
-    ).toBeVisible({ timeout: 120_000 });
-    const tick = await walletState(page);
-    expect(tick.tickTxid).toBeTruthy();
-    await mine();
-    await page
-      .getByRole("button", { name: "Sign and redeem", exact: true })
-      .click();
-    await expect
-      .poll(async () => (await walletState(page)).redemptionTxid)
-      .not.toBe("");
-    const { redemptionTxid } = await walletState(page);
-    const redemption = await rpc<{
-      vout: Array<{
-        scriptPubKey: { hex: string };
-        valuecommitment?: string;
-        assetcommitment?: string;
-      }>;
-    }>("getrawtransaction", [redemptionTxid, true]);
-    expect(redemption.vout[1].scriptPubKey.hex).toBe("6a0400000001");
-    for (const index of [0, 2]) {
-      expect(redemption.vout[index].valuecommitment).toMatch(
-        /^0[89][0-9a-f]{64}$/,
-      );
-      expect(redemption.vout[index].assetcommitment).toMatch(
-        /^0[ab][0-9a-f]{64}$/,
-      );
-    }
-    expect(redemption.vout[1].valuecommitment).toBeUndefined();
-    await mine();
-    await expect(page.locator(".win-block strong")).toHaveText(
-      "Position redeemed",
-    );
-    expect(await rpc("gettxout", [fundingTxid, 0])).toBeNull();
-    settlements.push(redemptionTxid);
-  }
-
-  expect(new Set(settlements).size).toBe(2);
-  expect(
-    approvals.filter((request) => request.method === "signMessage"),
-  ).toHaveLength(2);
-  expect(
-    approvals
-      .filter((request) => request.method === "signPset")
-      .map((request) => request.indexes),
-  ).toEqual([[0], [2], [0, 1], [2]]);
-  const publicState = await page.evaluate(
-    (key) => JSON.parse(localStorage.getItem(key) ?? "{}"),
-    stateKey,
-  );
-  expect(publicState.privateKey).toBeUndefined();
-  expect(publicState.rpcUrl).toBeUndefined();
-  expect(publicState.rpcUsername).toBeUndefined();
-  expect(publicState.rpcPassword).toBeUndefined();
-  expect(publicState.wallet.publicKey).toBe(
-    Buffer.from(pair.publicKey).toString("hex"),
-  );
-  await expect(page.locator(".settlement-row")).toHaveCount(2);
-  await page.reload();
-  await expect(page.locator(".settlement-row")).toHaveCount(2);
-  await expect(page.locator(".win-block strong")).toHaveText(
-    "Position redeemed",
-  );
-  await page
-    .getByRole("searchbox", { name: "Search markets" })
-    .fill(String(unique));
-  await expect(page.locator(".market-row")).toHaveCount(2);
-  for (const width of [1440, 390, 320]) {
-    await page.setViewportSize({ width, height: 1000 });
-    expect(
-      await page.evaluate(
-        () => document.documentElement.scrollWidth <= innerWidth,
-      ),
-    ).toBe(true);
-    await page.screenshot({
-      path: testInfo.outputPath(`settled-${width}.png`),
-      fullPage: true,
-    });
-  }
-  await page
-    .getByRole("region", { name: "Wallet summary" })
-    .getByRole("button")
-    .click();
-  await page
-    .getByRole("button", { name: "Disconnect Humid", exact: true })
-    .click();
-  await expect(
-    page.getByRole("button", { name: "Connect Humid", exact: true }).first(),
-  ).toBeVisible();
-  expect(approved).toBe(false);
-  await page.reload();
-  await expect(
-    page
-      .getByRole("region", { name: "Wallet summary" })
-      .getByRole("button", { name: "Connect Humid", exact: true }),
-  ).toBeVisible();
-
-  await page.setViewportSize({ width: 1440, height: 1000 });
   const coordinator =
     process.env.TEST_COORDINATOR_API ?? "http://127.0.0.1:9100";
   const rateResponse = await fetch(`${coordinator}/price-feeds/0`);
@@ -708,7 +553,6 @@ test("settles event and oracle price markets through Humid with fragmented walle
   ).toString();
   const priceTitle = `Will LBTC/USD touch the winning strike? ${unique}`;
   const expiryTitle = `Will LBTC/USD touch an unreachable strike? ${unique}`;
-  await page.getByRole("button", { name: "Demo", exact: true }).click();
   const priceDesk = page.getByRole("region", {
     name: "Price market publishing",
   });
@@ -734,9 +578,10 @@ test("settles event and oracle price markets through Humid with fragmented walle
     await priceDesk
       .getByRole("button", { name: "Publish price market" })
       .click();
-    const row = page.locator(".resolution-row").filter({ hasText: title });
-    await expect(row).toBeVisible();
-    await expect(row.getByRole("button", { name: "Resolve Yes" })).toHaveCount(
+    await expect(
+      page.getByText("Price market published.", { exact: true }),
+    ).toBeVisible();
+    await expect(page.getByRole("button", { name: "Resolve Yes" })).toHaveCount(
       0,
     );
   };
@@ -789,6 +634,11 @@ test("settles event and oracle price markets through Humid with fragmented walle
   await page.getByLabel("Stake, LBTC", { exact: true }).fill("0.0005");
   const previous = (await publicPriceState()).positionOutpoint;
   await page.getByRole("button", { name: "Participate", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "Humid approval rejected",
+  );
+  expect((await publicPriceState()).positionOutpoint).toBe(previous);
+  await page.getByRole("button", { name: "Participate", exact: true }).click();
   await expect
     .poll(async () => (await publicPriceState()).positionOutpoint)
     .not.toBe(previous);
@@ -816,6 +666,17 @@ test("settles event and oracle price markets through Humid with fragmented walle
     .poll(async () => (await publicPriceState()).redemptionTxid)
     .not.toBe("");
   const claimed = await publicPriceState();
+  expect(claimed.privateKey).toBeUndefined();
+  expect(claimed.rpcUrl).toBeUndefined();
+  expect(claimed.rpcUsername).toBeUndefined();
+  expect(claimed.rpcPassword).toBeUndefined();
+  expect(approvals.some((request) => request.method === "signMessage")).toBe(
+    true,
+  );
+  expect(
+    approvals.filter((request) => request.method === "signPset").at(-1)
+      ?.indexes,
+  ).toEqual([3]);
   const claimTransaction = await rpc<{
     vin: Array<{ txid: string; vout: number }>;
     vout: Array<{
@@ -913,4 +774,16 @@ test("settles event and oracle price markets through Humid with fragmented walle
   await expect(page.locator(".win-block strong")).toHaveText(
     "Position swept to house",
   );
+  for (const width of [1440, 390, 320]) {
+    await page.setViewportSize({ width, height: 1000 });
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth,
+      ),
+    ).toBe(true);
+    await page.screenshot({
+      path: testInfo.outputPath(`price-settled-${width}.png`),
+      fullPage: true,
+    });
+  }
 });

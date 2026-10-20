@@ -6,7 +6,6 @@ use price_oracle_contracts::voucher::{
 };
 use simplex::provider::SimplicityNetwork;
 use simplex::simplicityhl::elements::confidential::{Asset, Nonce, Value};
-use simplex::simplicityhl::elements::hashes::Hash;
 use simplex::simplicityhl::elements::secp256k1_zkp::{Keypair, Message, Secp256k1, SecretKey};
 use simplex::simplicityhl::elements::{
     AssetId, BlockHash, OutPoint, Script, TxOut, TxOutWitness, Txid,
@@ -16,7 +15,13 @@ use simplex::transaction::{FinalTransaction, PartialInput, PartialOutput, Requir
 use simplex::utils::hash_script;
 
 fn execute(data: PriceFeedData, above: bool, sweep: Option<u64>, defect: &str) -> bool {
-    execute_with_tick(data, above, sweep, defect, None)
+    execute_with_tick(
+        data,
+        above,
+        sweep,
+        defect,
+        sweep.is_none().then_some(data.received_at),
+    )
 }
 
 fn execute_with_tick(
@@ -26,10 +31,10 @@ fn execute_with_tick(
     defect: &str,
     claim_tick: Option<u64>,
 ) -> bool {
-    let asset = |byte| AssetId::from_slice(&[byte; 32]).unwrap();
+    let asset = |byte| AssetId::from_byte_array([byte; 32]);
     let network = SimplicityNetwork::ElementsCustom {
         policy_asset: asset(0x66),
-        genesis_hash: BlockHash::all_zeros(),
+        genesis_hash: BlockHash::from_byte_array([0; 32]),
     };
     let wallet = Script::from(vec![0x51]);
     let house = Script::from(vec![0x52]);
@@ -68,13 +73,9 @@ fn execute_with_tick(
         house_script_hash: hash_script(&house),
         network,
     };
-    let contract = if claim_tick.is_some() {
-        PriceMarketContract::new_with_tick(parameters)
-    } else {
-        PriceMarketContract::new(parameters)
-    };
+    let contract = PriceMarketContract::new_with_tick(parameters);
     let utxo = |asset, value, script_pubkey, vout| UTXO {
-        outpoint: OutPoint::new(Txid::all_zeros(), vout),
+        outpoint: OutPoint::new(Txid::from_byte_array([0; 32]), vout),
         txout: TxOut {
             asset: Asset::Explicit(asset),
             value: Value::Explicit(value),
@@ -95,18 +96,8 @@ fn execute_with_tick(
             tick_input_index: 1,
             house_output_index: 0,
         },
-        None if claim_tick.is_some() => PriceMarketSpend::ClaimWithTick {
+        None => PriceMarketSpend::ClaimWithTick {
             tick_input_index: 2,
-            verifier_input_index: 1,
-            verifier_tapleaf_hash: if defect == "leaf" {
-                [0; 32]
-            } else {
-                voucher.get_tapleaf_hash()
-            },
-            signed: SignedPrice::new(data, key.x_only_public_key().0.serialize(), signature),
-            payout_output_index: 0,
-        },
-        None => PriceMarketSpend::Claim {
             verifier_input_index: 1,
             verifier_tapleaf_hash: if defect == "leaf" {
                 [0; 32]
@@ -203,7 +194,7 @@ fn execute_with_tick(
         let input = transaction.inputs()[index].program_input.as_ref().unwrap();
         input
             .program
-            .finalize(&pset, &input.witness.build_witness(), index, &network)
+            .finalize(&pset, &input.witness, index, &network)
             .is_ok()
     })
 }
@@ -327,6 +318,8 @@ fn tick_claim_extends_signed_validity_by_exactly_fifty_five_minutes() {
 
 #[test]
 fn tick_claim_preserves_price_verifier_and_payout_checks() {
+    assert!(!execute_with_tick(PRICE, true, None, "", None));
+
     for defect in [
         "tick_asset",
         "key",

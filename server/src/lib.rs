@@ -12,24 +12,15 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     routing::{delete, get, post},
 };
-use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use simplex::program::ProgramTrait;
 use simplex::provider::SimplicityNetwork;
 use simplex::simplicityhl::elements::{
-    AssetId, BlockHash, EcdsaSighashType, OutPoint, Script, Transaction, TxOut, TxOutSecrets,
-    TxOutWitness, Txid,
+    AssetId, BlockHash, EcdsaSighashType, OutPoint, Script, Transaction, TxOut, TxOutWitness, Txid,
     bitcoin::PublicKey as BitcoinPublicKey,
     confidential::{Asset, Nonce, Value},
-    confidential::{AssetBlindingFactor, ValueBlindingFactor},
     secp256k1_zkp::{Secp256k1 as ZkpSecp256k1, rand::thread_rng},
 };
-use simplex::simplicityhl::simplicity::hashes::Hash as _;
-use simplex::simplicityhl::str::WitnessName;
-use simplex::simplicityhl::types::TypeInner;
-use simplex::simplicityhl::value::{UIntValue, ValueConstructible};
-use simplex::simplicityhl::{Value as SimplicityValue, WitnessValues};
 use simplex::transaction::utxo::UTXO;
 use simplex::transaction::{
     FinalTransaction, PartialInput, PartialOutput, ProgramInput, RequiredSignature,
@@ -40,25 +31,24 @@ use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
-use prediction_demo_contracts::{
-    PredictionContract, PredictionParameters, PredictionPayoutProofs, PredictionSpend,
-};
 use price_oracle_contracts::artifacts::voucher::VoucherProgram;
 use price_oracle_contracts::voucher::{
     Voucher, VoucherAuthMethod, VoucherParameters, VoucherSpendPath,
 };
 
 const SESSION_BYTES: usize = 32;
+mod db;
 mod escrow;
 mod price;
 
 #[derive(Clone, Deserialize)]
 pub struct Config {
     pub listen_address: SocketAddr,
-    pub data_file: PathBuf,
+    pub database_url: String,
+    #[serde(default = "default_database_max_connections")]
+    pub database_max_connections: u32,
     pub admin_login: String,
     pub admin_password: String,
-    pub admin_private_key: String,
     pub policy_asset_id: String,
     pub genesis_block_hash: String,
     #[serde(default = "default_session_lifetime")]
@@ -68,7 +58,13 @@ pub struct Config {
     #[serde(default = "price::default_oracle_url")]
     pub oracle_url: String,
     #[serde(default)]
+    pub trust_coordinator: bool,
+    #[serde(default)]
+    pub oracle_verification: Option<price::OracleVerificationConfig>,
+    #[serde(default)]
     pub escrow: Option<escrow::EscrowConfig>,
+    #[serde(default)]
+    pub auto_publish: price::AutoPublishConfig,
 }
 
 #[derive(Clone, Deserialize)]
@@ -95,6 +91,10 @@ fn default_session_lifetime() -> u64 {
     3_600
 }
 
+fn default_database_max_connections() -> u32 {
+    5
+}
+
 impl Config {
     pub async fn load(path: &Path) -> Result<Self, AppError> {
         let contents = tokio::fs::read_to_string(path).await?;
@@ -103,35 +103,20 @@ impl Config {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct Resolution {
-    pub occurred_at: u64,
-    pub signature: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Prediction {
     pub id: String,
     pub title: String,
     pub deadline: u64,
     pub created_at: u64,
-    pub resolution: Option<Resolution>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub price: Option<price::PriceMarket>,
-}
-
-#[derive(Default)]
-struct Store {
-    predictions: Vec<Prediction>,
-    sessions: HashMap<String, u64>,
+    pub price: price::PriceMarket,
 }
 
 #[derive(Clone)]
 struct AppState {
     config: Config,
     network: SimplicityNetwork,
-    keypair: Keypair,
-    admin_public_key: String,
-    store: Arc<RwLock<Store>>,
+    db: db::Database,
+    sessions: Arc<RwLock<HashMap<String, u64>>>,
     chain_client: reqwest::Client,
     escrows: escrow::Proposals,
     reserve_wallet: Option<escrow::LocalWallet>,
@@ -156,6 +141,10 @@ pub struct App {
 
 impl App {
     pub async fn new(config: Config) -> Result<Self, AppError> {
+        if config.trust_coordinator && config.oracle_verification.is_some() {
+            return Err(AppError::ConflictingOracleTrust);
+        }
+
         let policy_asset = config
             .policy_asset_id
             .parse::<AssetId>()
@@ -168,47 +157,33 @@ impl App {
             policy_asset,
             genesis_hash,
         };
-        let key_bytes: [u8; 32] = hex::decode(&config.admin_private_key)
-            .map_err(|_| AppError::InvalidAdminKey)?
-            .try_into()
-            .map_err(|_| AppError::InvalidAdminKey)?;
-        let secret_key = SecretKey::from_byte_array(key_bytes)?;
-        let keypair = Keypair::from_secret_key(&Secp256k1::new(), &secret_key);
-        let admin_public_key = hex::encode(keypair.x_only_public_key().0.serialize());
         let reserve_wallet = if let Some(escrow) = &config.escrow {
             if let Some(path) = &escrow.private_key_file {
                 if !escrow.wallet.is_empty() {
                     return Err(AppError::InvalidEscrowKey);
                 }
-                Some(escrow::LocalWallet::load(path, network, &key_bytes).await?)
+                Some(escrow::LocalWallet::load(path, network).await?)
             } else {
                 None
             }
         } else {
             None
         };
-        let predictions = match tokio::fs::read(&config.data_file).await {
-            Ok(data) => serde_json::from_slice(&data)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(error.into()),
-        };
+        let db =
+            db::Database::connect(&config.database_url, config.database_max_connections).await?;
 
         Ok(Self {
             state: AppState {
                 config,
                 network,
-                keypair,
-                admin_public_key,
                 escrows: Arc::default(),
                 reserve_wallet,
                 chain_client: reqwest::Client::builder()
                     .timeout(Duration::from_secs(15))
                     .redirect(reqwest::redirect::Policy::none())
                     .build()?,
-                store: Arc::new(RwLock::new(Store {
-                    predictions,
-                    sessions: HashMap::new(),
-                })),
+                db,
+                sessions: Arc::default(),
             },
         })
     }
@@ -218,10 +193,15 @@ impl App {
         self.state.config.listen_address
     }
 
+    pub async fn run_auto_publisher(&self) {
+        price::run_auto_publisher(&self.state).await;
+    }
+
     #[must_use]
     pub fn router(&self) -> Router {
         Router::new()
             .route("/api/config", get(public_config))
+            .route("/api/oracle/verification", post(price::verification))
             .route("/api/chain/tx", post(broadcast_transaction))
             .route("/api/chain/{*path}", get(read_chain))
             .route("/api/predictions", get(list_predictions))
@@ -236,18 +216,9 @@ impl App {
                 "/api/predictions/{id}/escrow/{funding_id}",
                 delete(escrow::cancel),
             )
-            .route(
-                "/api/predictions/{id}/redemption",
-                post(assemble_redemption),
-            )
-            .route("/api/predictions/{id}/resolution", get(get_resolution))
             .route("/api/admin/login", post(login))
             .route("/api/admin/escrow", get(escrow::status))
             .route("/api/admin/predictions", post(create_prediction))
-            .route(
-                "/api/admin/predictions/{id}/resolve",
-                post(resolve_prediction),
-            )
             .layer(
                 CorsLayer::new()
                     .allow_origin(Any)
@@ -260,7 +231,6 @@ impl App {
 
 #[derive(Serialize)]
 struct PublicConfig {
-    admin_public_key: String,
     policy_asset_id: String,
     genesis_block_hash: String,
     network: &'static str,
@@ -274,7 +244,6 @@ async fn public_config(State(state): State<AppState>) -> Json<PublicConfig> {
         && (state.reserve_wallet.is_some() || network == "elementsregtest");
 
     Json(PublicConfig {
-        admin_public_key: state.admin_public_key,
         policy_asset_id: state.config.policy_asset_id,
         genesis_block_hash: state.config.genesis_block_hash,
         network,
@@ -403,10 +372,10 @@ async fn broadcast_transaction(
         hex::decode(tx_hex).map_err(|_| ApiError::bad_request("invalid transaction hex"))?;
     let tx: Transaction = simplex::simplicityhl::elements::encode::deserialize(&bytes)
         .map_err(|_| ApiError::bad_request("invalid Elements transaction"))?;
-    let mut burn = tick_burn_allowance(&tx.output, state.network.policy_asset())?;
+    let burn = tick_burn_allowance(&tx.output, state.network.policy_asset())?;
     if burn > 0 {
-        let account = price::account(&state, &state.admin_public_key).await?;
-        burn = voucher_burn_allowance(
+        let account = price::network(&state).await?;
+        voucher_burn_allowance(
             &tx.output,
             state.network.policy_asset(),
             parse_asset(&account.tick_asset_id, "Tick asset")?,
@@ -448,37 +417,20 @@ async fn broadcast_transaction(
         return Ok(txid.to_string());
     }
 
-    let mut params = vec![
-        serde_json::json!(tx_hex),
-        serde_json::json!(0.1),
-        serde_json::json!(burn as f64 / 100_000_000.0),
-    ];
-    let response = loop {
-        let response: serde_json::Value = state
-            .chain_client
-            .post(&backend.rpc_url)
-            .basic_auth(&backend.rpc_username, Some(&backend.rpc_password))
-            .json(&serde_json::json!({
-                "jsonrpc": "1.0", "id": "prediction-broadcast", "method": "sendrawtransaction",
-                "params": params,
-            }))
-            .send()
-            .await
-            .map_err(|_| ApiError::internal("chain broadcaster unavailable"))?
-            .json()
-            .await
-            .map_err(|_| ApiError::internal("invalid broadcaster response"))?;
-        if params.len() == 3
-            && response["error"]["code"] == -1
-            && response["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.starts_with("sendrawtransaction "))
-        {
-            params.pop();
-            continue;
-        }
-        break response;
-    };
+    let response: serde_json::Value = state
+        .chain_client
+        .post(&backend.rpc_url)
+        .basic_auth(&backend.rpc_username, Some(&backend.rpc_password))
+        .json(&serde_json::json!({
+            "jsonrpc": "1.0", "id": "prediction-broadcast", "method": "sendrawtransaction",
+            "params": [tx_hex, 0.1],
+        }))
+        .send()
+        .await
+        .map_err(|_| ApiError::internal("chain broadcaster unavailable"))?
+        .json()
+        .await
+        .map_err(|_| ApiError::internal("invalid broadcaster response"))?;
     if !response["error"].is_null() {
         return Err(ApiError::bad_request(
             response["error"]["message"]
@@ -492,43 +444,29 @@ async fn broadcast_transaction(
         .ok_or_else(|| ApiError::internal("broadcaster returned no transaction ID"))
 }
 
-async fn list_predictions(State(state): State<AppState>) -> Json<Vec<Prediction>> {
-    Json(state.store.read().await.predictions.clone())
+async fn list_predictions(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<Prediction>>, ApiError> {
+    Ok(Json(state.db.list().await?))
 }
 
-async fn get_resolution(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<Json<Resolution>, ApiError> {
-    let store = state.store.read().await;
-    let prediction = store
-        .predictions
-        .iter()
-        .find(|prediction| prediction.id == id)
-        .ok_or_else(|| ApiError::not_found("prediction does not exist"))?;
-    prediction
-        .resolution
-        .clone()
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found("prediction has not been resolved"))
+async fn find_prediction(state: &AppState, id: &str) -> Result<Prediction, ApiError> {
+    state
+        .db
+        .find(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("prediction does not exist"))
 }
 
 #[derive(Deserialize)]
 struct DeriveContractRequest {
     payout_script_pubkey: String,
-    tick_asset_id: String,
-    tick_script_pubkey: String,
-    #[serde(default)]
-    confidential_payout: bool,
     owner_public_key: Option<String>,
 }
 
 #[derive(Serialize)]
 struct DerivedContract {
     script_pubkey: String,
-    tick_asset_id: String,
-    tick_script_pubkey: String,
-    confidential_payout: bool,
 }
 
 async fn derive_contract(
@@ -536,44 +474,8 @@ async fn derive_contract(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<DeriveContractRequest>,
 ) -> Result<Json<DerivedContract>, ApiError> {
-    let prediction_id = parse_prediction_id(&id)?;
-    let prediction = state
-        .store
-        .read()
-        .await
-        .predictions
-        .iter()
-        .find(|prediction| prediction.id == id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("prediction does not exist"))?;
-    if prediction.price.is_some() {
-        return price::derive(&state, &prediction, &request).await;
-    }
-    let admin_pubkey = state.keypair.x_only_public_key().0.serialize();
-    let tick_asset_id = parse_asset(&request.tick_asset_id, "Tick asset ID")?;
-    let tick_script = parse_script(&request.tick_script_pubkey, "Tick script")?;
-    let payout_script = parse_script(&request.payout_script_pubkey, "payout script")?;
-    let parameters = PredictionParameters {
-        prediction_id,
-        admin_pubkey,
-        deadline: prediction.deadline,
-        tick_asset_id,
-        tick_script_hash: hash_script(&tick_script),
-        payout_script_hash: hash_script(&payout_script),
-        network: state.network,
-    };
-    let contract = if request.confidential_payout {
-        PredictionContract::new_confidential(parameters)
-    } else {
-        PredictionContract::new(parameters)
-    };
-
-    Ok(Json(DerivedContract {
-        script_pubkey: hex::encode(contract.get_script_pubkey().into_bytes()),
-        tick_asset_id: request.tick_asset_id,
-        tick_script_pubkey: request.tick_script_pubkey,
-        confidential_payout: request.confidential_payout,
-    }))
+    let prediction = find_prediction(&state, &id).await?;
+    price::derive(&state, &prediction, &request).await
 }
 
 fn parse_script(value: &str, name: &str) -> Result<Script, ApiError> {
@@ -595,318 +497,10 @@ struct ExplicitUtxo {
     asset: String,
 }
 
-#[derive(Deserialize)]
-struct RedemptionRequest {
-    position: ExplicitUtxo,
-    tick: ExplicitUtxo,
-    fee: ExplicitUtxo,
-    payout_script_pubkey: String,
-    owner_public_key: String,
-    storm_eye_asset_id: String,
-    tick_signature: Option<String>,
-    tick_auth_script_pubkey: Option<String>,
-    payout_blinding_key: Option<String>,
-}
-
 #[derive(Serialize)]
 struct RedemptionResponse {
     tick_signature_hash: String,
     pset: Option<String>,
-}
-
-async fn assemble_redemption(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-    Json(request): Json<RedemptionRequest>,
-) -> Result<Json<RedemptionResponse>, ApiError> {
-    let prediction_id = parse_prediction_id(&id)?;
-    let prediction = state
-        .store
-        .read()
-        .await
-        .predictions
-        .iter()
-        .find(|prediction| prediction.id == id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("prediction does not exist"))?;
-    let resolution = prediction
-        .resolution
-        .ok_or_else(|| ApiError::conflict("prediction has not been resolved"))?;
-    let network = state.network;
-    let payout_script = parse_script(&request.payout_script_pubkey, "payout script")?;
-    let storm_eye_asset_id = parse_asset(&request.storm_eye_asset_id, "Storm Eye asset ID")?;
-    let owner_public_key = parse_hex_array::<32>(&request.owner_public_key, "owner public key")?;
-    let admin_signature = parse_hex_array::<64>(&resolution.signature, "admin signature")?;
-    let position_utxo = parse_utxo(&request.position, "position")?;
-    let tick_utxo = parse_utxo(&request.tick, "Tick")?;
-    let fee_utxo = parse_utxo(&request.fee, "fee")?;
-    let tick_asset_id = tick_utxo.explicit_asset();
-    if request.tick.amount_sats < resolution.occurred_at {
-        return Err(ApiError::bad_request(
-            "Tick timestamp predates the signed occurrence",
-        ));
-    }
-    if fee_utxo.explicit_asset() != position_utxo.explicit_asset()
-        || request.fee.amount_sats <= 1_000
-    {
-        return Err(ApiError::bad_request(
-            "fee UTXO must fund at least 1,001 sats of the position asset",
-        ));
-    }
-
-    let parameters = || PredictionParameters {
-        prediction_id,
-        admin_pubkey: state.keypair.x_only_public_key().0.serialize(),
-        deadline: prediction.deadline,
-        tick_asset_id,
-        tick_script_hash: hash_script(&tick_utxo.txout.script_pubkey),
-        payout_script_hash: hash_script(&payout_script),
-        network,
-    };
-    let confidential_contract = PredictionContract::new_confidential(parameters());
-    let confidential_payout =
-        confidential_contract.get_script_pubkey() == position_utxo.txout.script_pubkey;
-    let prediction_contract = if confidential_payout {
-        confidential_contract
-    } else {
-        PredictionContract::new(parameters())
-    };
-    if prediction_contract.get_script_pubkey() != position_utxo.txout.script_pubkey {
-        return Err(ApiError::bad_request(
-            "position UTXO does not match the compiled prediction contract",
-        ));
-    }
-    let auth_script = request
-        .tick_auth_script_pubkey
-        .as_deref()
-        .map(|value| parse_script(value, "Tick authorization script"))
-        .transpose()?;
-    if confidential_payout && auth_script.is_none() {
-        return Err(ApiError::bad_request(
-            "confidential redemption requires a script-authorized Tick",
-        ));
-    }
-    if let Some(auth_script) = &auth_script {
-        if auth_script != &fee_utxo.txout.script_pubkey || auth_script != &payout_script {
-            return Err(ApiError::bad_request(
-                "Tick authorization must match the wallet fee input and payout script",
-            ));
-        }
-    }
-    let voucher_parameters = VoucherParameters {
-        storm_eye_asset_id,
-        auth_method: match &auth_script {
-            Some(script) => VoucherAuthMethod::Script {
-                auth_script_hash: hash_script(script),
-            },
-            None => VoucherAuthMethod::Signature {
-                auth_pubkey: owner_public_key,
-            },
-        },
-        network,
-    };
-    let voucher_program = VoucherProgram::new(&voucher_parameters.build_arguments());
-    if voucher_program.get_script_pubkey(&network) != tick_utxo.txout.script_pubkey {
-        return Err(ApiError::bad_request(
-            "Tick UTXO does not match its authorization covenant",
-        ));
-    }
-
-    let tick_signature = request
-        .tick_signature
-        .as_deref()
-        .map(|value| parse_hex_array::<64>(value, "Tick signature"))
-        .transpose()?;
-    let tick_spend_path = match auth_script {
-        Some(_) => VoucherSpendPath::ScriptAuth {
-            auth_input_index: 2,
-            voucher_output_index: 1,
-        },
-        None => VoucherSpendPath::SignatureAuth {
-            voucher_output_index: 1,
-        },
-    };
-    let mut transaction = FinalTransaction::new();
-    let spend = || PredictionSpend {
-        occurred_at: resolution.occurred_at,
-        admin_signature,
-        tick_input_index: 1,
-        payout_output_index: 0,
-    };
-    prediction_contract.attach_spend(&mut transaction, &position_utxo, spend());
-    transaction.add_program_input(
-        PartialInput::new(tick_utxo.clone()),
-        ProgramInput::new(
-            Box::new(voucher_program.as_ref().clone()),
-            Box::new(tick_spend_path.build_witness()),
-        ),
-        tick_spend_path.required_signature(),
-    );
-    transaction.add_input(
-        PartialInput::new(fee_utxo.clone()),
-        RequiredSignature::NativeEcdsa,
-    );
-    transaction.add_output(PartialOutput::new(
-        payout_script.clone(),
-        position_utxo.explicit_amount(),
-        position_utxo.explicit_asset(),
-    ));
-    transaction.add_output(PartialOutput::new(
-        Voucher::get_burn_script(1),
-        tick_utxo.explicit_amount(),
-        tick_utxo.explicit_asset(),
-    ));
-    transaction.add_output(PartialOutput::new(
-        payout_script,
-        request.fee.amount_sats - 1_000,
-        position_utxo.explicit_asset(),
-    ));
-    transaction.add_output(PartialOutput::new(
-        Script::new(),
-        1_000,
-        position_utxo.explicit_asset(),
-    ));
-
-    let (mut pset, _) = transaction.extract_pst();
-    if confidential_payout {
-        let blinding_key = request
-            .payout_blinding_key
-            .as_deref()
-            .ok_or_else(|| {
-                ApiError::bad_request("confidential payout requires a wallet blinding public key")
-            })?
-            .parse::<BitcoinPublicKey>()
-            .map_err(|_| ApiError::bad_request("invalid payout blinding public key"))?;
-        if !blinding_key.compressed {
-            return Err(ApiError::bad_request(
-                "payout blinding public key must be compressed",
-            ));
-        }
-        let secp = ZkpSecp256k1::new();
-        let mut rng = thread_rng();
-        let secrets = HashMap::from([(
-            2,
-            TxOutSecrets {
-                asset: fee_utxo.explicit_asset(),
-                asset_bf: AssetBlindingFactor::zero(),
-                value: fee_utxo.explicit_amount(),
-                value_bf: ValueBlindingFactor::zero(),
-            },
-        )]);
-        pset.outputs_mut()[0].blinding_key = Some(blinding_key);
-        pset.outputs_mut()[0].blinder_index = Some(2);
-        let factors = pset
-            .blind_non_last(&mut rng, &secp, &secrets)
-            .map_err(|error| ApiError::bad_request(format!("payout blinding: {error}")))?;
-        let (abf, vbf) = factors[0];
-        pset.outputs_mut()[0].blinder_index = None;
-        pset.outputs_mut()[2].blinding_key = Some(blinding_key);
-        pset.outputs_mut()[2].blinder_index = Some(2);
-        pset.blind_last(&mut rng, &secp, &secrets)
-            .map_err(|error| ApiError::bad_request(format!("fee change blinding: {error}")))?;
-        for index in [0, 2] {
-            pset.outputs_mut()[index].blinder_index = Some(0);
-        }
-        let proofs = PredictionPayoutProofs::new(prediction_id, resolution.occurred_at, abf, vbf)
-            .map_err(|error| {
-            ApiError::bad_request(format!("payout commitment proof: {error}"))
-        })?;
-        let mut confidential_spend = FinalTransaction::new();
-        prediction_contract.attach_confidential_spend(
-            &mut confidential_spend,
-            &position_utxo,
-            spend(),
-            proofs,
-        );
-        transaction.inputs_mut()[0].program_input =
-            confidential_spend.inputs()[0].program_input.clone();
-    }
-    let tick_hash = voucher_program
-        .as_ref()
-        .get_env(&pset, 1, &network)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?
-        .c_tx_env()
-        .sighash_all()
-        .to_byte_array();
-    if request.tick_signature.is_none() && request.tick_auth_script_pubkey.is_none() {
-        return Ok(Json(RedemptionResponse {
-            tick_signature_hash: hex::encode(tick_hash),
-            pset: None,
-        }));
-    }
-
-    for index in 0..2 {
-        let program_input = transaction.inputs()[index]
-            .program_input
-            .as_ref()
-            .expect("both covenant inputs have programs");
-        let witness = if index == 1 && request.tick_auth_script_pubkey.is_none() {
-            build_signed_voucher_witness(
-                voucher_program.as_ref(),
-                tick_signature.expect("checked above"),
-                1,
-            )?
-        } else {
-            program_input.witness.build_witness()
-        };
-        let finalized = program_input
-            .program
-            .finalize(&pset, &witness, index, &network)
-            .map_err(|error| ApiError::bad_request(format!("covenant input {index}: {error}")))?;
-        pset.inputs_mut()[index].final_script_witness = Some(finalized);
-    }
-    for input in pset.inputs_mut() {
-        input.amount = None;
-        input.asset = None;
-    }
-    pset.inputs_mut()[2].sighash_type = Some(EcdsaSighashType::All.into());
-
-    Ok(Json(RedemptionResponse {
-        tick_signature_hash: hex::encode(tick_hash),
-        pset: Some(pset.to_string()),
-    }))
-}
-
-fn build_signed_voucher_witness(
-    program: &dyn ProgramTrait,
-    signature: [u8; 64],
-    voucher_output_index: u32,
-) -> Result<WitnessValues, ApiError> {
-    let witness_name = WitnessName::from_str_unchecked("PATH");
-    let witness_types = program
-        .get_witness_types()
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let witness_type = witness_types
-        .get(&witness_name)
-        .ok_or_else(|| ApiError::bad_request("Voucher PATH witness is missing"))?;
-    let TypeInner::Either(other_auth_type, signature_or_network_type) = witness_type.as_inner()
-    else {
-        return Err(ApiError::bad_request(
-            "Voucher PATH witness has an invalid type",
-        ));
-    };
-    let TypeInner::Either(_, network_auth_type) = signature_or_network_type.as_inner() else {
-        return Err(ApiError::bad_request(
-            "Voucher signature witness has an invalid type",
-        ));
-    };
-
-    let signature_path = SimplicityValue::tuple([
-        SimplicityValue::byte_array(signature),
-        SimplicityValue::from(UIntValue::U32(voucher_output_index)),
-    ]);
-    let signature_or_network = SimplicityValue::left(signature_path, (**network_auth_type).clone());
-    let signed_path = SimplicityValue::right((**other_auth_type).clone(), signature_or_network);
-    if signed_path.ty() != witness_type {
-        return Err(ApiError::bad_request(
-            "Voucher signature does not match the PATH witness type",
-        ));
-    }
-
-    Ok(WitnessValues::from(HashMap::from([(
-        witness_name,
-        signed_path,
-    )])))
 }
 
 fn parse_asset(value: &str, name: &str) -> Result<AssetId, ApiError> {
@@ -969,10 +563,9 @@ async fn login(
     let expires_at = now.saturating_add(state.config.session_lifetime_seconds);
     let token = random_token();
     state
-        .store
+        .sessions
         .write()
         .await
-        .sessions
         .insert(token.clone(), expires_at);
 
     Ok(Json(LoginResponse { token, expires_at }))
@@ -1001,10 +594,10 @@ async fn create_prediction(
     if request.deadline <= now {
         return Err(ApiError::bad_request("deadline must be in the future"));
     }
-    let price = match request.price {
-        Some(price) => Some(price::publish(&state, price, request.deadline).await?),
-        None => None,
-    };
+    let price = request
+        .price
+        .ok_or_else(|| ApiError::bad_request("predictions require oracle price terms"))?;
+    let price = price::publish(&state, price, request.deadline).await?;
 
     let id = prediction_id(title, request.deadline, Uuid::new_v4());
     let prediction = Prediction {
@@ -1012,63 +605,13 @@ async fn create_prediction(
         title: title.to_string(),
         deadline: request.deadline,
         created_at: now,
-        resolution: None,
         price,
     };
-    {
-        let mut store = state.store.write().await;
-        store.predictions.push(prediction.clone());
-        persist(&state.config.data_file, &store.predictions).await?;
+    if !state.db.insert(&prediction).await? {
+        return Err(ApiError::conflict("prediction already exists"));
     }
 
     Ok((StatusCode::CREATED, Json(prediction)))
-}
-
-#[derive(Deserialize)]
-struct ResolvePrediction {
-    occurred_at: u64,
-}
-
-async fn resolve_prediction(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-    Json(request): Json<ResolvePrediction>,
-) -> Result<Json<Resolution>, ApiError> {
-    authenticate(&state, &headers).await?;
-    let prediction_id = parse_prediction_id(&id)?;
-    let message = resolution_digest(prediction_id, request.occurred_at);
-    let signature = Secp256k1::new().sign_schnorr_no_aux_rand(&message, &state.keypair);
-    let resolution = Resolution {
-        occurred_at: request.occurred_at,
-        signature: signature.to_string(),
-    };
-
-    {
-        let mut store = state.store.write().await;
-        let prediction = store
-            .predictions
-            .iter_mut()
-            .find(|prediction| prediction.id == id)
-            .ok_or_else(|| ApiError::not_found("prediction does not exist"))?;
-        if prediction.price.is_some() {
-            return Err(ApiError::bad_request(
-                "price markets resolve through the oracle, not the admin",
-            ));
-        }
-        if request.occurred_at > prediction.deadline {
-            return Err(ApiError::bad_request(
-                "occurrence time is after the prediction deadline",
-            ));
-        }
-        if prediction.resolution.is_some() {
-            return Err(ApiError::conflict("prediction is already resolved"));
-        }
-        prediction.resolution = Some(resolution.clone());
-        persist(&state.config.data_file, &store.predictions).await?;
-    }
-
-    Ok(Json(resolution))
 }
 
 async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -1078,23 +621,13 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<(), ApiEr
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or_else(|| ApiError::unauthorized("missing admin token"))?;
     let now = unix_time()?;
-    let mut store = state.store.write().await;
-    store.sessions.retain(|_, expires_at| *expires_at > now);
-    if store.sessions.contains_key(token) {
+    let mut sessions = state.sessions.write().await;
+    sessions.retain(|_, expires_at| *expires_at > now);
+    if sessions.contains_key(token) {
         Ok(())
     } else {
         Err(ApiError::unauthorized("admin token is invalid or expired"))
     }
-}
-
-async fn persist(path: &Path, predictions: &[Prediction]) -> Result<(), ApiError> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let temporary = path.with_extension("json.tmp");
-    tokio::fs::write(&temporary, serde_json::to_vec_pretty(predictions)?).await?;
-    tokio::fs::rename(temporary, path).await?;
-    Ok(())
 }
 
 fn prediction_id(title: &str, deadline: u64, nonce: Uuid) -> String {
@@ -1110,16 +643,6 @@ fn parse_prediction_id(id: &str) -> Result<[u8; 32], ApiError> {
         .map_err(|_| ApiError::bad_request("invalid prediction id"))?
         .try_into()
         .map_err(|_| ApiError::bad_request("invalid prediction id"))
-}
-
-#[must_use]
-pub fn resolution_digest(prediction_id: [u8; 32], occurred_at: u64) -> [u8; 32] {
-    let mut occurred_at_bytes = [0u8; 32];
-    occurred_at_bytes[24..].copy_from_slice(&occurred_at.to_be_bytes());
-    let mut hash = Sha256::new();
-    hash.update(prediction_id);
-    hash.update(occurred_at_bytes);
-    hash.finalize().into()
 }
 
 fn random_token() -> String {
@@ -1150,19 +673,21 @@ pub enum AppError {
     #[error(transparent)]
     Toml(#[from] toml::de::Error),
     #[error(transparent)]
-    Json(#[from] serde_json::Error),
+    Database(#[from] sqlx::Error),
+    #[error(transparent)]
+    Migration(#[from] sqlx::migrate::MigrateError),
     #[error(transparent)]
     Secp256k1(#[from] secp256k1::Error),
-    #[error("admin_private_key must be a valid 32-byte secp256k1 secret key")]
-    InvalidAdminKey,
     #[error(
-        "escrow private key file must contain a valid separate 32-byte secret key; choose either a local key file or a node wallet"
+        "escrow private key file must contain a valid 32-byte secret key; choose either a local key file or a node wallet"
     )]
     InvalidEscrowKey,
     #[error("policy_asset_id must be a valid Elements asset ID")]
     InvalidPolicyAsset,
     #[error("genesis_block_hash must be a valid Elements block hash")]
     InvalidGenesisHash,
+    #[error("choose either trust_coordinator = true or pinned [oracle_verification], not both")]
+    ConflictingOracleTrust,
 }
 
 #[derive(Debug)]
@@ -1230,6 +755,13 @@ impl From<serde_json::Error> for ApiError {
     }
 }
 
+impl From<sqlx::Error> for ApiError {
+    fn from(error: sqlx::Error) -> Self {
+        tracing::error!(%error, "database operation failed");
+        Self::internal("database operation failed")
+    }
+}
+
 impl From<std::time::SystemTimeError> for ApiError {
     fn from(error: std::time::SystemTimeError) -> Self {
         Self::internal(error.to_string())
@@ -1242,26 +774,61 @@ mod tests {
 
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
-    use secp256k1::{Secp256k1, schnorr::Signature};
     use tower::ServiceExt;
 
     use super::*;
 
-    pub(super) fn config(data_file: PathBuf) -> Config {
+    pub(super) const HOLDER_PUBLIC_KEY: &str =
+        "4f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa";
+
+    pub(super) fn config() -> Config {
         Config {
             listen_address: "127.0.0.1:0".parse().unwrap(),
-            data_file,
+            database_url: "sqlite::memory:".into(),
+            database_max_connections: 1,
+            auto_publish: price::AutoPublishConfig::default(),
             admin_login: "oracle-admin".into(),
             admin_password: "test-password".into(),
-            admin_private_key: "11".repeat(32),
             policy_asset_id: "66".repeat(32),
             genesis_block_hash: "cd179c84c35f51825f20a3b91a18d45f0c53b5ceb744a5b6ef8f0babe809396f"
                 .into(),
             session_lifetime_seconds: 60,
             chain_backend: ChainBackendConfig::default(),
             oracle_url: price::default_oracle_url(),
+            trust_coordinator: false,
+            oracle_verification: None,
             escrow: None,
         }
+    }
+
+    pub(super) fn price_terms() -> price::PriceMarket {
+        price::PriceMarket {
+            feed_id: 0,
+            decimals: 8,
+            strike: "10000000000".into(),
+            above: true,
+            opens_at: 1000,
+            claim_grace: 600,
+            house_script_pubkey: format!("0014{}", "55".repeat(20)),
+            tick_asset_id: "33".repeat(32),
+            verifier_asset_id: "44".repeat(32),
+            storm_eye_asset_id: "55".repeat(32),
+        }
+    }
+
+    pub(super) fn oracle_routes(network: &'static str) -> Router {
+        let metadata = move || async move {
+            let terms = price_terms();
+            Json(serde_json::json!({
+                "network": network,
+                "tick_asset_id": terms.tick_asset_id,
+                "oracle_verifier_asset_id": terms.verifier_asset_id,
+                "storm_eye_asset_id": terms.storm_eye_asset_id,
+            }))
+        };
+        Router::new()
+            .route("/users/network", get(metadata))
+            .route("/users/account/{owner}", get(metadata))
     }
 
     async fn response_json(response: axum::response::Response) -> serde_json::Value {
@@ -1280,8 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_config_exposes_chain_identity_without_credentials() {
-        let temp = std::env::temp_dir().join(format!("prediction-demo-{}.json", Uuid::new_v4()));
-        let app = App::new(config(temp)).await.unwrap();
+        let app = App::new(config()).await.unwrap();
         let response = app
             .router()
             .oneshot(
@@ -1296,7 +862,6 @@ mod tests {
         assert_eq!(
             response_json(response).await,
             serde_json::json!({
-                "admin_public_key": app.state.admin_public_key,
                 "policy_asset_id": app.state.config.policy_asset_id,
                 "genesis_block_hash": app.state.config.genesis_block_hash,
                 "network": "elementsregtest",
@@ -1346,7 +911,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_broadcast_supports_elements_23_without_retrying_rejections() {
+    async fn rpc_broadcast_uses_elements_parameters_without_retrying_errors() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let transaction = Transaction {
@@ -1361,8 +926,8 @@ mod tests {
         for (error, expected_status, expected_calls) in [
             (
                 serde_json::json!({"code": -1, "message": "sendrawtransaction \"hexstring\" ( maxfeerate )"}),
-                StatusCode::OK,
-                2,
+                StatusCode::BAD_REQUEST,
+                1,
             ),
             (serde_json::Value::Null, StatusCode::OK, 1),
             (
@@ -1382,12 +947,9 @@ mod tests {
                     let txid = txid.clone();
                     async move {
                         assert_eq!(request["method"], "sendrawtransaction");
-                        let attempt = count.fetch_add(1, Ordering::Relaxed);
-                        assert_eq!(
-                            request["params"].as_array().unwrap().len(),
-                            if attempt == 0 { 3 } else { 2 }
-                        );
-                        Json(if attempt == 0 && !error.is_null() {
+                        count.fetch_add(1, Ordering::Relaxed);
+                        assert_eq!(request["params"].as_array().unwrap().len(), 2);
+                        Json(if !error.is_null() {
                             serde_json::json!({"result": null, "error": error})
                         } else {
                             serde_json::json!({"result": txid, "error": null})
@@ -1398,8 +960,7 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let task = tokio::spawn(async move { axum::serve(listener, chain).await.unwrap() });
-            let mut config =
-                config(std::env::temp_dir().join(format!("rpc-broadcast-{}.json", Uuid::new_v4())));
+            let mut config = config();
             config.chain_backend.rpc_url = url;
             let response = App::new(config)
                 .await
@@ -1473,8 +1034,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, chain).await.unwrap() });
-        let mut config =
-            config(std::env::temp_dir().join(format!("esplora-broadcast-{}.json", Uuid::new_v4())));
+        let mut config = config();
         config.chain_backend.esplora_url = url.clone();
         config.chain_backend.rpc_url.clear();
         config.oracle_url = url;
@@ -1509,69 +1069,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_creates_and_resolves_prediction_with_verifiable_signature() {
-        let temp = std::env::temp_dir().join(format!("prediction-demo-{}.json", Uuid::new_v4()));
-        let app = App::new(config(temp.clone())).await.unwrap();
-        let public_key = app.state.keypair.x_only_public_key().0;
-        let router = app.router();
+    async fn rejects_predictions_without_oracle_price_terms() {
+        let app = App::new(config()).await.unwrap();
+        let now = unix_time().unwrap();
+        app.state
+            .sessions
+            .write()
+            .await
+            .insert("test-session".into(), now + 3600);
+        let mut request = json_request(
+            "POST",
+            "/api/admin/predictions",
+            serde_json::json!({ "title": "Unsupported event", "deadline": now + 3600 }),
+        );
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Bearer test-session".parse().unwrap(),
+        );
+        assert_eq!(
+            app.router().oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(app.state.db.list().await.unwrap().is_empty());
+    }
 
-        let login = router
+    #[tokio::test]
+    async fn event_routes_are_unavailable() {
+        let app = App::new(config()).await.unwrap();
+        let market = Prediction {
+            id: "88".repeat(32),
+            title: "Price market".into(),
+            deadline: unix_time().unwrap() + 3600,
+            created_at: 1000,
+            price: price_terms(),
+        };
+        app.state.db.insert(&market).await.unwrap();
+        let router = app.router();
+        let response = router
             .clone()
             .oneshot(json_request(
-                "POST",
-                "/api/admin/login",
-                serde_json::json!({"login":"oracle-admin","password":"test-password"}),
+                "GET",
+                "/api/predictions",
+                serde_json::Value::Null,
             ))
             .await
             .unwrap();
-        assert_eq!(login.status(), StatusCode::OK);
-        let token = response_json(login).await["token"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let deadline = unix_time().unwrap() + 3_600;
+        assert_eq!(response_json(response).await, serde_json::json!([market]));
 
-        let mut create = json_request(
-            "POST",
-            "/api/admin/predictions",
-            serde_json::json!({"title":"Event A happens","deadline":deadline}),
-        );
-        create.headers_mut().insert(
-            header::AUTHORIZATION,
-            format!("Bearer {token}").parse().unwrap(),
-        );
-        let created = router.clone().oneshot(create).await.unwrap();
-        assert_eq!(created.status(), StatusCode::CREATED);
-        let prediction = response_json(created).await;
-        let id = prediction["id"].as_str().unwrap();
-        let occurred_at = deadline - 10;
-
-        let mut resolve = json_request(
-            "POST",
-            &format!("/api/admin/predictions/{id}/resolve"),
-            serde_json::json!({"occurred_at":occurred_at}),
-        );
-        resolve.headers_mut().insert(
-            header::AUTHORIZATION,
-            format!("Bearer {token}").parse().unwrap(),
-        );
-        let resolved = router.oneshot(resolve).await.unwrap();
-        assert_eq!(resolved.status(), StatusCode::OK);
-        let resolved = response_json(resolved).await;
-        let signature = Signature::from_str(resolved["signature"].as_str().unwrap()).unwrap();
-        let prediction_id: [u8; 32] = hex::decode(id).unwrap().try_into().unwrap();
-        let message = resolution_digest(prediction_id, occurred_at);
-        Secp256k1::verification_only()
-            .verify_schnorr(&signature, &message, &public_key)
-            .unwrap();
-
-        let _ = tokio::fs::remove_file(temp).await;
+        for (method, path, body) in [
+            (
+                "GET",
+                format!("/api/predictions/{}/resolution", market.id),
+                serde_json::json!({}),
+            ),
+            (
+                "POST",
+                format!("/api/admin/predictions/{}/resolve", market.id),
+                serde_json::json!({ "occurred_at": 1500 }),
+            ),
+            (
+                "POST",
+                format!("/api/predictions/{}/redemption", market.id),
+                serde_json::json!({}),
+            ),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(json_request(method, &path, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        assert_eq!(app.state.db.find(&market.id).await.unwrap(), Some(market));
     }
 
     #[tokio::test]
     async fn rejects_invalid_admin_credentials() {
-        let temp = std::env::temp_dir().join(format!("prediction-demo-{}.json", Uuid::new_v4()));
-        let app = App::new(config(temp)).await.unwrap();
+        let app = App::new(config()).await.unwrap();
         let response = app
             .router()
             .oneshot(json_request(
@@ -1586,237 +1160,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assembles_redemption_after_owner_signs_the_tick_hash() {
-        assert_redemption(false, false).await;
-    }
-
-    #[tokio::test]
-    async fn assembles_redemption_authorized_by_the_wallet_fee_input() {
-        assert_redemption(true, false).await;
-    }
-
-    #[tokio::test]
-    async fn assembles_confidential_redemption_without_changing_legacy_positions() {
-        assert_redemption(true, true).await;
-    }
-
-    async fn assert_redemption(script_auth: bool, confidential_payout: bool) {
-        let temp = std::env::temp_dir().join(format!("prediction-demo-{}.json", Uuid::new_v4()));
-        let owner_secret = SecretKey::from_byte_array([0x22; 32]).unwrap();
-        let owner_keypair = Keypair::from_secret_key(&Secp256k1::new(), &owner_secret);
-        let owner_public_key = owner_keypair.x_only_public_key().0.serialize();
-        let payout_script = Script::from(hex::decode(format!("0014{}", "55".repeat(20))).unwrap());
-        let tick_asset = parse_asset(&"33".repeat(32), "Tick asset").unwrap();
-        let storm_eye_asset = parse_asset(&"44".repeat(32), "Storm Eye asset").unwrap();
-        let network = SimplicityNetwork::ElementsCustom {
-            policy_asset: parse_asset(&"66".repeat(32), "policy asset").unwrap(),
-            genesis_hash: "cd179c84c35f51825f20a3b91a18d45f0c53b5ceb744a5b6ef8f0babe809396f"
-                .parse()
-                .unwrap(),
-        };
-        let voucher = VoucherProgram::new(
-            &VoucherParameters {
-                storm_eye_asset_id: storm_eye_asset,
-                auth_method: if script_auth {
-                    VoucherAuthMethod::Script {
-                        auth_script_hash: hash_script(&payout_script),
-                    }
-                } else {
-                    VoucherAuthMethod::Signature {
-                        auth_pubkey: owner_public_key,
-                    }
-                },
-                network,
-            }
-            .build_arguments(),
+    async fn database_preserves_predictions_across_restarts() {
+        let directory =
+            std::env::temp_dir().join(format!("prediction-database-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let mut config = config();
+        config.database_url = format!(
+            "sqlite://{}/predictions.sqlite3?mode=rwc",
+            directory.display()
         );
-        let tick_script = voucher.get_script_pubkey(&network);
-        let app_config = config(temp.clone());
-        let app = App::new(app_config).await.unwrap();
-        let prediction_id = [0x77; 32];
-        let prediction_id_hex = hex::encode(prediction_id);
-        let occurred_at = 1_700_000_000;
-        let deadline = occurred_at + 60;
-        let resolution_signature = Secp256k1::new()
-            .sign_schnorr_no_aux_rand(
-                &resolution_digest(prediction_id, occurred_at),
-                &app.state.keypair,
-            )
-            .to_string();
-        app.state.store.write().await.predictions.push(Prediction {
-            id: prediction_id_hex.clone(),
-            title: "Event A happens".into(),
-            deadline,
-            created_at: occurred_at - 60,
-            price: None,
-            resolution: Some(Resolution {
-                occurred_at,
-                signature: resolution_signature,
-            }),
-        });
-        let position_asset = parse_asset(&"66".repeat(32), "position asset").unwrap();
-        let parameters = PredictionParameters {
-            prediction_id,
-            admin_pubkey: app.state.keypair.x_only_public_key().0.serialize(),
-            deadline,
-            tick_asset_id: tick_asset,
-            tick_script_hash: hash_script(&tick_script),
-            payout_script_hash: hash_script(&payout_script),
-            network,
+        let prediction = Prediction {
+            id: "77".repeat(32),
+            title: "BTC/USD reaches its target".into(),
+            deadline: 2000,
+            created_at: 1000,
+            price: price_terms(),
         };
-        let prediction_contract = if confidential_payout {
-            PredictionContract::new_confidential(parameters)
-        } else {
-            PredictionContract::new(parameters)
-        };
-        let mut request = serde_json::json!({
-            "position": {
-                "txid": "01".repeat(32), "vout": 0,
-                "script_pubkey": hex::encode(prediction_contract.get_script_pubkey().into_bytes()),
-                "amount_sats": 50_000, "asset": position_asset.to_string()
-            },
-            "tick": {
-                "txid": "02".repeat(32), "vout": 1,
-                "script_pubkey": hex::encode(tick_script.into_bytes()),
-                "amount_sats": occurred_at + 10, "asset": tick_asset.to_string()
-            },
-            "fee": {
-                "txid": "03".repeat(32), "vout": 2,
-                "script_pubkey": hex::encode(payout_script.clone().into_bytes()),
-                "amount_sats": 10_000, "asset": position_asset.to_string()
-            },
-            "payout_script_pubkey": hex::encode(payout_script.clone().into_bytes()),
-            "owner_public_key": hex::encode(owner_public_key),
-            "storm_eye_asset_id": storm_eye_asset.to_string()
-        });
-        let uri = format!("/api/predictions/{prediction_id_hex}/redemption");
-        if confidential_payout {
-            let blind_secret =
-                simplex::simplicityhl::elements::secp256k1_zkp::SecretKey::from_slice(&[0x77; 32])
-                    .unwrap();
-            let blind_public =
-                simplex::simplicityhl::elements::secp256k1_zkp::PublicKey::from_secret_key(
-                    &ZkpSecp256k1::new(),
-                    &blind_secret,
-                );
-            request["payout_blinding_key"] = serde_json::json!(blind_public.to_string());
-        }
-        if script_auth {
-            request["tick_auth_script_pubkey"] =
-                serde_json::json!(hex::encode(payout_script.into_bytes()));
-            let mut wrong_wallet = request.clone();
-            wrong_wallet["tick_auth_script_pubkey"] =
-                serde_json::json!(format!("0014{}", "99".repeat(20)));
-            let rejected = app
-                .router()
-                .oneshot(json_request("POST", &uri, wrong_wallet))
-                .await
-                .unwrap();
-            assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
-        }
-        if confidential_payout {
-            for field in ["payout_blinding_key", "tick_auth_script_pubkey"] {
-                let mut invalid = request.clone();
-                invalid.as_object_mut().unwrap().remove(field);
-                let rejected = app
-                    .router()
-                    .oneshot(json_request("POST", &uri, invalid))
-                    .await
-                    .unwrap();
-                assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
-            }
-        }
-        let prepared = app
-            .router()
-            .oneshot(json_request("POST", &uri, request.clone()))
-            .await
-            .unwrap();
-        let prepared_status = prepared.status();
-        let prepared = response_json(prepared).await;
-        assert_eq!(prepared_status, StatusCode::OK, "{prepared}");
-        let tick_hash: [u8; 32] = hex::decode(prepared["tick_signature_hash"].as_str().unwrap())
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let tick_signature = Secp256k1::new()
-            .sign_schnorr_no_aux_rand(&tick_hash, &owner_keypair)
-            .to_string();
-        let tick_signature_bytes = hex::decode(&tick_signature).unwrap();
-        let mut signed_request = request;
-        signed_request["tick_signature"] = serde_json::Value::String(tick_signature);
-        let finalized = app
-            .router()
-            .oneshot(json_request("POST", &uri, signed_request))
-            .await
-            .unwrap();
-        let finalized_status = finalized.status();
-        let mut finalized = response_json(finalized).await;
-        assert_eq!(finalized_status, StatusCode::OK, "{finalized}");
-        if script_auth {
-            finalized = prepared;
-        }
-        let pset = finalized["pset"]
-            .as_str()
-            .unwrap()
-            .parse::<simplex::simplicityhl::elements::pset::PartiallySignedTransaction>()
-            .unwrap();
-        let expected_final_tick_witness = if script_auth {
-            pset.inputs()[1]
-                .final_script_witness
-                .clone()
-                .expect("script authorization must finalize the Tick without a wallet signature")
-        } else {
-            let tick_signature_bytes: [u8; 64] = tick_signature_bytes.try_into().unwrap();
-            let expected_tick_witness =
-                build_signed_voucher_witness(voucher.as_ref(), tick_signature_bytes, 1).unwrap();
-            voucher
-                .as_ref()
-                .finalize(&pset, &expected_tick_witness, 1, &network)
-                .unwrap()
-        };
+
+        let app = App::new(config.clone()).await.unwrap();
+        assert!(app.state.db.insert(&prediction).await.unwrap());
+        let restored = App::new(config).await.unwrap();
         assert_eq!(
-            pset.inputs()[2].sighash_type,
-            Some(EcdsaSighashType::All.into())
-        );
-        assert_eq!(pset.outputs()[1].script_pubkey, Voucher::get_burn_script(1));
-        assert_eq!(pset.outputs()[0].amount_comm.is_some(), confidential_payout);
-        assert_eq!(pset.outputs()[2].amount_comm.is_some(), confidential_payout);
-        assert!(pset.outputs()[1].amount_comm.is_none());
-        assert!(pset.outputs()[3].amount_comm.is_none());
-        if confidential_payout {
-            for index in [0, 2] {
-                assert_eq!(pset.outputs()[index].blinder_index, Some(0));
-            }
-            let secp = ZkpSecp256k1::new();
-            let transaction = pset.extract_tx().unwrap();
-            let previous = pset
-                .inputs()
-                .iter()
-                .map(|input| input.witness_utxo.clone().unwrap())
-                .collect::<Vec<_>>();
-            transaction.verify_tx_amt_proofs(&secp, &previous).unwrap();
-            let blind_secret =
-                simplex::simplicityhl::elements::secp256k1_zkp::SecretKey::from_slice(&[0x77; 32])
-                    .unwrap();
-            for (index, expected) in [(0, 50_000), (2, 9_000)] {
-                let secrets = transaction.output[index]
-                    .unblind(&secp, blind_secret)
-                    .unwrap();
-                assert_eq!(secrets.value, expected);
-                assert_eq!(secrets.asset, position_asset);
-            }
-        }
-        assert!(
-            pset.inputs()
-                .iter()
-                .all(|input| input.amount.is_none() && input.asset.is_none())
+            restored.state.db.list().await.unwrap(),
+            vec![prediction.clone()]
         );
         assert_eq!(
-            pset.inputs()[1].final_script_witness.as_ref(),
-            Some(&expected_final_tick_witness),
-            "Tick covenant witness should be finalized with the supplied signature"
+            restored.state.db.find(&prediction.id).await.unwrap(),
+            Some(prediction)
         );
-
-        let _ = tokio::fs::remove_file(temp).await;
+        drop(app);
+        drop(restored);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 }

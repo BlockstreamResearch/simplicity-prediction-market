@@ -3,9 +3,3 @@
 #![allow(clippy::all)]
 #[rustfmt::skip]
 pub mod prediction_price_tick;
-#[rustfmt::skip]
-pub mod prediction_price;
-#[rustfmt::skip]
-pub mod prediction_confidential;
-#[rustfmt::skip]
-pub mod prediction;

@@ -76,12 +76,18 @@ export type WalletDescriptor = {
   }>;
 };
 
+export class HumidNotDetectedError extends Error {
+  constructor() {
+    super("Humid was not detected in this browser");
+    this.name = "HumidNotDetectedError";
+  }
+}
+
 async function provider(): Promise<HumidProvider> {
   const started = Date.now();
   while (!window.humid && Date.now() - started < 3_000)
     await new Promise((resolve) => window.setTimeout(resolve, 50));
-  if (!window.humid)
-    throw new Error("Install and unlock Humid to connect your wallet");
+  if (!window.humid) throw new HumidNotDetectedError();
   return window.humid;
 }
 async function invoke<Result>(

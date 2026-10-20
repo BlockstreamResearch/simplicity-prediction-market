@@ -1,0 +1,62 @@
+name: prediction-demo
+
+services:
+  postgres:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: prediction-demo
+      POSTGRES_PASSWORD: prediction-demo
+      POSTGRES_DB: prediction-demo
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "prediction-demo", "-d", "prediction-demo"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  server:
+    build:
+      context: ..
+      dockerfile: prediction-demo/server/Dockerfile
+    restart: unless-stopped
+    environment:
+      RUST_LOG: ${RUST_LOG:-info,sqlx=warn}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ${PREDICTION_CONFIG:-./docker/server.toml}:/etc/prediction-demo/config.toml:ro
+      - escrow-data:/var/lib/prediction-demo
+    ports:
+      - "127.0.0.1:${API_PORT:-3100}:3100"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:3100/api/predictions"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  web:
+    build:
+      context: ..
+      dockerfile: prediction-demo/web/Dockerfile
+      args:
+        VITE_SERVER_API: ${VITE_SERVER_API:-http://127.0.0.1:${API_PORT:-3100}}
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8080}:80"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--output-document=/dev/null", "http://127.0.0.1/"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  postgres-data:
+  escrow-data:

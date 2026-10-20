@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
-  ArrowRight, Check, ChevronLeft, Clock3, LoaderCircle, LogIn, Plus, Radio,
+  ArrowRight, Check, ChevronLeft, Clock3, LoaderCircle, LogIn, Radio,
   RefreshCw, Search, Settings2, ShieldCheck, SquareArrowOutUpRight, Trophy, WalletCards, X, LogOut,
 } from 'lucide-react'
 import { Buffer } from 'buffer'
@@ -9,17 +9,18 @@ import {
   address, CreatorOutput, Pset,
 } from 'liquidjs-lib'
 import {
-  PriceOracleClient, createWalletTickRequest, createTickSpendPlan,
+  PriceOracleClient,
   createWalletSignedPriceRequest, decodePriceData, parseExecutedSignedPrice,
-  parseExecutedTick, walletRequestSigningMessage, type IssuedTick, type OracleAccount,
-  type OracleUtxo, type TickSpendPlan, type PriceFeedInfo, type PriceFeedRate,
+  parseExecutedTick, walletRequestSigningMessage, type OracleAccount,
+  type OracleUtxo, type PriceFeedInfo, type PriceFeedRate,
 } from '@price-oracle/sdk'
 import './App.css'
-import { addWalletInputDerivation, createFundingPset, EsploraClient, getPayoutBlindingKey, hydrateFundingPset, selectFundingUtxos, verifyMatchedEscrow } from './wallet'
-import { connectHumid, getHumidUtxos, revokeHumidSession, sameHumidWallet, signHumidMessage, signHumidPset, signAndBroadcastHumidPset,
+import { addWalletInputDerivation, createFundingPset, EsploraClient, hydrateFundingPset, selectFundingUtxos, verifyMatchedEscrow } from './wallet'
+import { connectHumid, getHumidUtxos, HumidNotDetectedError, revokeHumidSession, sameHumidWallet, signHumidMessage, signHumidPset, signAndBroadcastHumidPset,
   subscribeToHumidChanges, validateHumidSession, type HumidWallet, type HumidUtxo } from './humid'
-import { displayPrice, fundOracleRequest, meetsMarket, meetsPriceTick, PRICE_VALIDITY_EXTENSION_SECONDS, waitForOutput, type PriceClaim, type PriceMarket } from './price-market'
+import { displayPrice, fundOracleRequest, loadOracleVerification, meetsMarket, meetsPriceTick, PRICE_VALIDITY_EXTENSION_SECONDS, verifyIssuedPriceOutputs, verifyMarketAssets, waitForOutput, type PriceClaim, type PriceMarket } from './price-market'
 import PriceDesk from './PriceDesk'
+import HumidInstallDialog from './HumidInstallDialog'
 
 const SATS = 100_000_000
 const TRANSACTION_FEE = 1_000
@@ -30,17 +31,16 @@ type Prediction = {
   title: string
   deadline: number
   created_at: number
-  resolution: { occurred_at: number; signature: string } | null
-  price?: PriceMarket
+  price: PriceMarket
 }
-type Contract = { script_pubkey: string; tick_asset_id: string; tick_script_pubkey: string; confidential_payout: boolean }
-type ExplicitUtxo = { txid: string; vout: number; script_pubkey: string; amount_sats: number; asset: string; confidential_payout?: boolean; stake_sats?: number }
+type Contract = { script_pubkey: string }
+type ExplicitUtxo = { txid: string; vout: number; script_pubkey: string; amount_sats: number; asset: string; stake_sats?: number }
 export type ServerConfig = {
   policy_asset_id: string
   genesis_block_hash: string
-  network?: 'elementsregtest' | 'liquidtestnet'
-  oracle_url?: string
-  matched_escrow_enabled?: boolean
+  network: 'elementsregtest' | 'liquidtestnet'
+  oracle_url: string
+  matched_escrow_enabled: boolean
 }
 type Notice = { kind: 'error' | 'success'; message: string }
 type StageState = 'idle' | 'pending' | 'done'
@@ -51,36 +51,30 @@ type Position = {
   positionUtxo: ExplicitUtxo | null
   positionConfirmations: number
   redemptionFeeUtxo: ExplicitUtxo | null
-  tick: IssuedTick | null
-  spendPlan: TickSpendPlan | null
   redemptionTxid: string
   redemptionConfirmations: number
-  tickRequestHash: string
   priceRequestHash: string
   priceClaim: PriceClaim | null
   priceSwept: boolean
 }
-// Flat position fields mirror the selected market for readers of the earlier single-position state.
-type PersistedUserState = Position & {
+type PersistedUserState = {
   wallet: HumidWallet | null
   account: OracleAccount | null
   walletScript: string
   walletUtxos: OracleUtxo[]
   selected: string | null
   stake: string
-  fundedPredictionId: string
   positions: Record<string, Position>
   settlements: Settlement[]
 }
 
 const emptyPosition: Position = {
   feeOutpoint: '', positionOutpoint: '', positionUtxo: null, positionConfirmations: 0, redemptionFeeUtxo: null,
-  tick: null, spendPlan: null, redemptionTxid: '', redemptionConfirmations: 0, tickRequestHash: '',
+  redemptionTxid: '', redemptionConfirmations: 0,
   priceRequestHash: '', priceClaim: null, priceSwept: false,
 }
 
 const serverApi = import.meta.env.VITE_SERVER_API ?? 'http://127.0.0.1:3100'
-const defaultCoordinatorApi = import.meta.env.VITE_COORDINATOR_API ?? 'http://127.0.0.1:9100'
 const chainBackend = `${serverApi}/api/chain`
 const chain = new EsploraClient(chainBackend)
 const USER_STATE_KEY = 'signal-market:user-state:v3'
@@ -104,14 +98,6 @@ function shortHex(value: string, size = 7) {
   return `${value.slice(0, size)}...${value.slice(-size)}`
 }
 
-function loadPositions(state: Partial<PersistedUserState>): Record<string, Position> {
-  if (state.positions) return state.positions
-  if (!state.fundedPredictionId) return {}
-  const keys = Object.keys(emptyPosition) as (keyof Position)[]
-  const position = Object.fromEntries(keys.map((key) => [key, state[key] ?? emptyPosition[key]])) as Position
-  return { [state.fundedPredictionId]: position }
-}
-
 function isActive(position: Position) {
   return Boolean(position.positionOutpoint && (!position.redemptionTxid || position.redemptionConfirmations < 1))
 }
@@ -124,15 +110,11 @@ function marketStatus(market: Prediction, position: Position | undefined, now: n
     return position.redemptionConfirmations < 1 ? { label: 'Claiming', tone: 'neutral' } : { label: 'Claimed', tone: 'success' }
   }
   const funded = Boolean(position?.positionOutpoint)
-  if (position?.priceClaim || position?.spendPlan) return { label: 'Claimable', tone: 'accent' }
-  if (market.price) {
-    if (now < market.price.opens_at) return { label: 'Scheduled', tone: 'neutral' }
-    if (now <= market.deadline) return { label: 'Open', tone: 'open' }
-    if (funded && now <= market.deadline + market.price.claim_grace) return { label: 'Claim window', tone: 'accent' }
-    return { label: 'Expired', tone: 'danger' }
-  }
-  if (market.resolution) return funded ? { label: 'Claimable', tone: 'accent' } : { label: 'Resolved Yes', tone: 'success' }
-  return now <= market.deadline ? { label: 'Open', tone: 'open' } : { label: 'Awaiting result', tone: 'neutral' }
+  if (position?.priceClaim) return { label: 'Claimable', tone: 'accent' }
+  if (now < market.price.opens_at) return { label: 'Scheduled', tone: 'neutral' }
+  if (now <= market.deadline) return { label: 'Open', tone: 'open' }
+  if (funded && now <= market.deadline + market.price.claim_grace) return { label: 'Claim window', tone: 'accent' }
+  return { label: 'Expired', tone: 'danger' }
 }
 
 function useAutoDismiss(notice: Notice | null, setNotice: (notice: Notice | null) => void) {
@@ -154,9 +136,9 @@ async function json<Result>(path: string, init?: RequestInit): Promise<Result> {
 }
 
 function UserView({ predictions, refresh, config, walletSlot }: { predictions: Prediction[]; refresh: () => Promise<void>; config: ServerConfig; walletSlot: HTMLElement | null }) {
-  const coordinatorApi = config.oracle_url ?? defaultCoordinatorApi
+  const coordinatorApi = config.oracle_url
   const stateKey = config.network === 'liquidtestnet' ? `${USER_STATE_KEY}:${config.genesis_block_hash}` : USER_STATE_KEY
-  const matchedEscrowEnabled = config.matched_escrow_enabled ?? config.network !== 'liquidtestnet'
+  const matchedEscrowEnabled = config.matched_escrow_enabled
   const [initialState] = useState(() => loadUserState(stateKey))
   const [wallet, setWallet] = useState<HumidWallet | null>(initialState.wallet ?? null)
   const [connected, setConnected] = useState(false)
@@ -165,13 +147,14 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
   const [walletUtxos, setWalletUtxos] = useState<OracleUtxo[]>(initialState.walletUtxos ?? [])
   const [selected, setSelected] = useState<string | null>(initialState.selected ?? predictions[0]?.id ?? null)
   const [stake, setStake] = useState(initialState.stake ?? '0.001')
-  const [positions, setPositions] = useState<Record<string, Position>>(() => loadPositions(initialState))
+  const [positions, setPositions] = useState<Record<string, Position>>(initialState.positions ?? {})
   const [livePrice, setLivePrice] = useState<PriceFeedRate | null>(null)
   const [feedSymbols, setFeedSymbols] = useState<Record<number, string>>({})
   const [settlements, setSettlements] = useState<Settlement[]>(initialState.settlements ?? [])
   const [search, setSearch] = useState('')
-  const [filter, setFilter] = useState<'all' | 'open' | 'resolved'>('all')
+  const [filter, setFilter] = useState<'all' | 'open' | 'closed'>('all')
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [humidInstall, setHumidInstall] = useState<{ trigger: Element | null } | null>(null)
   const [now, setNow] = useState(() => Date.now() / 1000)
   const [busy, setBusy] = useState<string | null>(null)
   const [notice, setNotice] = useState<Notice | null>(null)
@@ -179,8 +162,8 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
   const prediction = predictions.find(({ id }) => id === selected)
   const position = prediction ? positions[prediction.id] : undefined
   const {
-    feeOutpoint, positionOutpoint, positionUtxo, positionConfirmations, redemptionFeeUtxo, tick, spendPlan,
-    redemptionTxid, redemptionConfirmations, tickRequestHash, priceRequestHash, priceClaim, priceSwept,
+    feeOutpoint, positionOutpoint, positionUtxo, positionConfirmations, redemptionFeeUtxo,
+    redemptionTxid, redemptionConfirmations, priceRequestHash, priceClaim, priceSwept,
   } = position ?? emptyPosition
   const priceTerms = prediction?.price
   const liveQualifies = Boolean(priceTerms && livePrice && livePrice.main.feed.valid_until > now
@@ -190,14 +173,12 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
   const isFundedPrediction = Boolean(position?.positionOutpoint)
   const positionActive = Boolean(position && isActive(position))
   const activePositions = Object.values(positions).filter(isActive)
-  const marketOpen = prediction && !prediction.resolution && prediction.deadline > now
+  const marketOpen = prediction && now >= prediction.price.opens_at && prediction.deadline > now
   const ticketStatus = prediction ? marketStatus(prediction, position, now) : { label: '', tone: 'neutral' as StatusTone }
-  const won = Boolean(prediction && (priceTerms
-    ? isFundedPrediction && (priceClaim || redemptionTxid) && !priceSwept
-    : prediction.resolution))
+  const won = Boolean(isFundedPrediction && (priceClaim || redemptionTxid) && !priceSwept)
   const visiblePredictions = predictions.filter((item) => (
     item.title.toLowerCase().includes(search.toLowerCase())
-      && (filter === 'all' || (filter === 'resolved' ? Boolean(item.resolution) : !item.resolution && item.deadline > now))
+      && (filter === 'all' || (filter === 'closed' ? item.deadline <= now : now >= item.price.opens_at && item.deadline > now))
   ))
   const balance = walletUtxos.reduce((sum, item) => sum + item.amountSats, 0)
   const positionStage: StageState = !isFundedPrediction || !positionOutpoint
@@ -235,21 +216,31 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
   }, [priceTerms])
 
   useEffect(() => {
-    const current = selected ? positions[selected] : undefined
     const state: PersistedUserState = {
-      ...(current ?? emptyPosition), fundedPredictionId: current ? selected! : '',
       wallet, account, walletScript, walletUtxos, selected, stake, positions, settlements,
     }
-    localStorage.setItem(stateKey, JSON.stringify(state))
-  }, [stateKey, wallet, account, walletScript, walletUtxos, selected, stake, positions, settlements])
+    localStorage.setItem(stateKey, JSON.stringify({ ...initialState, ...state }))
+  }, [stateKey, initialState, wallet, account, walletScript, walletUtxos, selected, stake, positions, settlements])
 
   useEffect(() => {
     if (!wallet) return
     let cancelled = false
-    void validateHumidSession(wallet, chainBackend).then((valid) => { if (!cancelled) setConnected(valid) })
+    const restore = async () => {
+      if (!await validateHumidSession(wallet, chainBackend)) {
+        if (!cancelled) setConnected(false)
+        return
+      }
+      await chain.validateGenesis(config.genesis_block_hash)
+      const verification = await loadOracleVerification(serverApi, wallet, config.network)
+      const verified = await new PriceOracleClient(coordinatorApi).getAccount(wallet.publicKey.slice(2), verification)
+      if (!cancelled) { setAccount(verified); setWalletScript(wallet.scriptPubKey); setConnected(true) }
+    }
+    void restore().catch((error: unknown) => {
+      if (!cancelled) { setConnected(false); setNotice({ kind: 'error', message: error instanceof Error ? error.message : 'Account verification failed' }) }
+    })
     const unsubscribe = subscribeToHumidChanges(() => { if (!cancelled) setConnected(false) })
     return () => { cancelled = true; unsubscribe() }
-  }, [wallet])
+  }, [wallet, config.genesis_block_hash, config.network, coordinatorApi])
 
   useEffect(() => {
     const pending = Object.entries(positions).filter(([, item]) => (
@@ -318,6 +309,7 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
   }
 
   async function connect() {
+    const trigger = humidInstall?.trigger ?? document.activeElement
     setBusy('connect')
     setNotice(null)
     try {
@@ -326,8 +318,9 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
       if (activePositions.length > 0 && wallet && !sameHumidWallet(wallet, nextWallet)) {
         throw new Error('Reconnect the Humid account that owns your active positions')
       }
-      const nextAccount = await new PriceOracleClient(coordinatorApi).getAccount(nextWallet.publicKey.slice(2), nextWallet.scriptPubKey)
-      if (nextAccount.network !== (config.network ?? 'elementsregtest')) throw new Error('The oracle network does not match the prediction chain')
+      const verification = await loadOracleVerification(serverApi, nextWallet, config.network)
+      const nextAccount = await new PriceOracleClient(coordinatorApi).getAccount(nextWallet.publicKey.slice(2), verification)
+      if (nextAccount.network !== config.network) throw new Error('The oracle network does not match the prediction chain')
       const utxos = toOracleUtxos(await getHumidUtxos(nextWallet))
 
       setWallet(nextWallet)
@@ -338,7 +331,8 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
       setSettingsOpen(false)
       setNotice({ kind: 'success', message: `Wallet connected with ${utxos.length} spendable UTXO${utxos.length === 1 ? '' : 's'}.` })
     } catch (error) {
-      setNotice({ kind: 'error', message: error instanceof Error ? error.message : 'Connection failed' })
+      if (error instanceof HumidNotDetectedError) setHumidInstall({ trigger })
+      else setNotice({ kind: 'error', message: error instanceof Error ? error.message : 'Connection failed' })
     } finally { setBusy(null) }
   }
 
@@ -355,6 +349,9 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
     setNotice(null)
     let pendingFundingId: string | null = null
     try {
+      const verification = await loadOracleVerification(serverApi, wallet, config.network)
+      verifyMarketAssets(prediction.price, verification)
+      const account = await new PriceOracleClient(coordinatorApi).getAccount(wallet.publicKey.slice(2), verification)
       const policyAsset = wallet.policyAssetId
       const humidUtxos = await getHumidUtxos(wallet)
       const discovered = toOracleUtxos(humidUtxos)
@@ -370,12 +367,11 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
       const fundingInputs = inputs.map((input) => humidUtxos.find((utxo) => utxo.txid === input.txid && utxo.vout === input.vout)!)
       const confidentialInput = fundingInputs.find((input) => input.confidential)
       const feeReserve = confidentialInput ? 2 * TRANSACTION_FEE : change
-      const contractRequest = { payout_script_pubkey: walletScript, tick_asset_id: account.tick_asset_id, tick_script_pubkey: account.tick_script_pubkey, confidential_payout: !prediction.price, owner_public_key: wallet.publicKey.slice(2) }
+      const contractRequest = { payout_script_pubkey: walletScript, owner_public_key: wallet.publicKey.slice(2) }
       const contract = await json<Contract>(`/api/predictions/${prediction.id}/contract`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify(contractRequest),
       })
-      if (!prediction.price && !contract.confidential_payout) throw new Error('The demo server does not support confidential payouts')
       const outputs = [new CreatorOutput(policyAsset, stakeSats, Buffer.from(contract.script_pubkey, 'hex')),
         new CreatorOutput(policyAsset, ORACLE_FEE, Buffer.from(account.script_pubkey, 'hex')),
         new CreatorOutput(policyAsset, feeReserve, Buffer.from(walletScript, 'hex'))]
@@ -407,7 +403,7 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
         ...emptyPosition,
         positionOutpoint: `${txid}:0`,
         feeOutpoint: `${txid}:1`,
-        positionUtxo: { txid, vout: 0, script_pubkey: contract.script_pubkey, amount_sats: funding.escrow_sats, asset: policyAsset, confidential_payout: contract.confidential_payout, stake_sats: stakeSats },
+        positionUtxo: { txid, vout: 0, script_pubkey: contract.script_pubkey, amount_sats: funding.escrow_sats, asset: policyAsset, stake_sats: stakeSats },
         redemptionFeeUtxo: { txid, vout: 2, script_pubkey: walletScript, amount_sats: feeReserve, asset: policyAsset },
       })
       setNotice({ kind: 'success', message: `Yes position locked in ${shortHex(txid)}.` })
@@ -423,50 +419,14 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
     } finally { setBusy(null) }
   }
 
-  async function requestTick() {
-    if (!prediction?.resolution || !feeOutpoint || !account || !wallet || !connected || !isFundedPrediction) return
-    setBusy('tick')
-    setNotice(null)
-    try {
-      const client = new PriceOracleClient(coordinatorApi)
-      let requestHash = tickRequestHash
-      if (!requestHash) {
-        const request = createWalletTickRequest(wallet.publicKey, [feeOutpoint], walletScript)
-        request.header.signature = await signHumidMessage(wallet, walletRequestSigningMessage(request))
-        requestHash = (await client.submitTickRequest(request)).request_hash
-      }
-      updatePosition(prediction.id, { tickRequestHash: requestHash })
-      let issued: IssuedTick | null = null
-      for (let attempt = 0; attempt < 90 && !issued; attempt += 1) {
-        const status = await client.getTickRequest(requestHash)
-        if (status.status === 'failed') throw new Error(status.payload ?? 'Tick request failed')
-        const executed = parseExecutedTick(status)
-        const result = executed?.results.find(({ kind }) => kind === 'tick-utxo')
-        if (executed && result) {
-          const details = JSON.parse(result.payload) as { timestamp: number }
-          issued = { txid: executed.txid, vout: result.vout, asset: account.tick_asset_id,
-            timestamp: details.timestamp, scriptPubKey: account.tick_script_pubkey }
-          break
-        }
-        await new Promise((resolve) => window.setTimeout(resolve, 1_000))
-      }
-      if (!issued) throw new Error('Oracle request is still pending. Check again to resume this request.')
-      updatePosition(prediction.id, { tick: issued, spendPlan: createTickSpendPlan(issued, {
-        predictionId: prediction.id, occurredAt: prediction.resolution.occurred_at,
-        signature: prediction.resolution.signature,
-      }) })
-      setNotice({ kind: 'success', message: `Tick ${shortHex(issued.txid)} is ready for redemption.` })
-    } catch (error) {
-      setNotice({ kind: 'error', message: error instanceof Error ? error.message : 'Tick request failed' })
-    } finally { setBusy(null) }
-  }
-
   async function requestPrice() {
     if (!prediction?.price || !account || !wallet || !connected || !isFundedPrediction || redemptionTxid) return
     setBusy('price')
     setNotice(null)
     try {
       const client = new PriceOracleClient(coordinatorApi)
+      const verification = await loadOracleVerification(serverApi, wallet, config.network)
+      verifyMarketAssets(prediction.price, verification)
       let requestHash = priceRequestHash
       if (!requestHash) {
         let oracleFee = feeOutpoint
@@ -485,7 +445,12 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
       for (let attempt = 0; attempt < 120; attempt += 1) {
         const status = await client.getTickRequest(requestHash)
         if (status.status === 'failed') { updatePosition(prediction.id, { priceRequestHash: '' }); throw new Error(status.payload ?? 'Price request failed') }
-        const issued = parseExecutedSignedPrice(status)
+        const issued = parseExecutedSignedPrice(status, {
+          stormTreeRoot: verification.stormTreeRoot,
+          feedId: prediction.price.feed_id,
+          decimals: prediction.price.decimals,
+          now: BigInt(Math.floor(Date.now() / 1000)),
+        })
         if (issued) {
           if (!meetsMarket(issued.signedPrice, prediction.price, prediction.deadline)) {
             updatePosition(prediction.id, { priceRequestHash: '' })
@@ -499,8 +464,7 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
             waitForOutput(chain, issued.txid, issued.verifierVout),
             waitForOutput(chain, issued.txid, ticks[0].vout),
           ])
-          if (voucher.asset !== prediction.price.verifier_asset_id || voucher.amount_sats !== 1) throw new Error('Oracle returned an invalid Verifier output')
-          if (!meetsPriceTick(issued.signedPrice, priceTick, prediction.price.tick_asset_id)) throw new Error('Tick is outside the signed price validity plus 55 minutes')
+          verifyIssuedPriceOutputs(issued.signedPrice, voucher, priceTick, verification)
           updatePosition(prediction.id, { priceClaim: { voucher, tick: priceTick, signedPrice: issued.signedPrice } })
           setNotice({ kind: 'success', message: 'Signed price verified. The Tick and Verifier are ready to claim.' })
           return
@@ -544,41 +508,8 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
     finally { setBusy(null) }
   }
 
-  async function redeem() {
-    if (!prediction?.resolution || !account || !wallet || !connected || !positionUtxo || !redemptionFeeUtxo || !tick || !isFundedPrediction || redemptionTxid) return
-    setBusy('redeem')
-    setNotice(null)
-    try {
-      const request = {
-        position: positionUtxo,
-        tick: { txid: tick.txid, vout: tick.vout, script_pubkey: tick.scriptPubKey, amount_sats: tick.timestamp, asset: tick.asset },
-        fee: redemptionFeeUtxo,
-        payout_script_pubkey: walletScript,
-        owner_public_key: wallet.publicKey.slice(2),
-        storm_eye_asset_id: account.storm_eye_asset_id,
-        tick_auth_script_pubkey: walletScript,
-        payout_blinding_key: positionUtxo.confidential_payout
-          ? getPayoutBlindingKey(await getHumidUtxos(wallet), redemptionFeeUtxo, wallet)
-          : undefined,
-      }
-      const prepared = await json<{ pset: string }>(`/api/predictions/${prediction.id}/redemption`, {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(request),
-      })
-      const pset = Pset.fromBase64(prepared.pset)
-      const sighashType = pset.inputs[2].sighashType
-      if (sighashType === undefined) throw new Error('redemption fee input has no sighash type')
-      addWalletInputDerivation(pset, 2, wallet)
-      const txid = await signAndBroadcastHumidPset(wallet, pset.toBase64(), [{ address: wallet.address, index: 2 }], chainBackend)
-
-      updatePosition(prediction.id, { redemptionTxid: txid, redemptionConfirmations: 0 })
-      setSettlements((previous) => [{ predictionId: prediction.id, title: prediction.title, amountSats: positionUtxo.amount_sats, txid }, ...previous])
-      setNotice({ kind: 'success', message: `Winning position redeemed in ${shortHex(txid)}.` })
-    } catch (error) {
-      setNotice({ kind: 'error', message: error instanceof Error ? error.message : 'Redemption failed' })
-    } finally { setBusy(null) }
-  }
-
   return <div className="workspace">
+    {humidInstall && <HumidInstallDialog returnFocus={humidInstall.trigger} onClose={() => setHumidInstall(null)} onRetry={() => { setHumidInstall(null); void connect() }} />}
     <section className="portfolio-bar" aria-label="Wallet overview">
       <span className="section-label">Wallet overview</span>
       <div className="portfolio-item"><span>Available balance</span><strong>{connected ? (balance / SATS).toFixed(8) : '--'} <small>LBTC</small></strong></div>
@@ -598,11 +529,11 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
     </section>}
     <main className="market-panel">
       <div className="section-heading market-heading"><button className="icon-button" title="Refresh markets" disabled={busy !== null} onClick={() => { void refresh().catch(() => setNotice({ kind: 'error', message: 'Markets could not be refreshed' })) }}><RefreshCw size={20} /></button><h1>Markets</h1></div>
-      <div className="market-toolbar"><div className="market-tabs" role="tablist" aria-label="Market status">{(['all', 'open', 'resolved'] as const).map((value) => <button key={value} role="tab" aria-selected={filter === value} className={filter === value ? 'active' : ''} onClick={() => setFilter(value)}>{value === 'all' ? 'All markets' : value === 'open' ? 'Open' : 'Resolved'}</button>)}</div><label className="search-field"><Search size={16} /><input type="search" aria-label="Search markets" placeholder="Search markets" value={search} onChange={(event) => setSearch(event.target.value)} /></label></div>
+      <div className="market-toolbar"><div className="market-tabs" role="tablist" aria-label="Market status">{(['all', 'open', 'closed'] as const).map((value) => <button key={value} role="tab" aria-selected={filter === value} className={filter === value ? 'active' : ''} onClick={() => setFilter(value)}>{value === 'all' ? 'All markets' : value === 'open' ? 'Open' : 'Closed'}</button>)}</div><label className="search-field"><Search size={16} /><input type="search" aria-label="Search markets" placeholder="Search markets" value={search} onChange={(event) => setSearch(event.target.value)} /></label></div>
       <div className="market-columns"><span>Market</span><span>Outcome</span></div>
       <div className="market-list">
         {visiblePredictions.length === 0 && <div className="empty-state"><Search size={24} /><strong>{search ? 'No matching markets' : 'No markets in this view'}</strong></div>}
-        {visiblePredictions.map((item) => <button key={item.id} aria-pressed={selected === item.id} disabled={busy !== null} className={`market-row ${selected === item.id ? 'selected' : ''}`} onClick={() => { setSelected(item.id); setNotice(null) }}><span className={`market-symbol ${item.resolution ? 'settled' : ''}`}>{item.resolution ? <Check size={19} /> : <Radio size={19} />}</span><span className="market-copy"><strong>{item.title}</strong><small><Clock3 size={13} />{formatTime(item.deadline)}{positions[item.id] && isActive(positions[item.id]) && <span className="position-tag">Your position</span>}</small></span><span className={`status ${marketStatus(item, positions[item.id], now).tone}`}>{marketStatus(item, positions[item.id], now).label}</span><ArrowRight size={17} /></button>)}
+        {visiblePredictions.map((item) => <button key={item.id} aria-pressed={selected === item.id} disabled={busy !== null} className={`market-row ${selected === item.id ? 'selected' : ''}`} onClick={() => { setSelected(item.id); setNotice(null) }}><span className={`market-symbol ${(positions[item.id]?.redemptionConfirmations ?? 0) >= 1 ? 'settled' : ''}`}><Radio size={19} /></span><span className="market-copy"><strong>{item.title}</strong><small><Clock3 size={13} />{formatTime(item.deadline)}{positions[item.id] && isActive(positions[item.id]) && <span className="position-tag">Your position</span>}</small></span><span className={`status ${marketStatus(item, positions[item.id], now).tone}`}>{marketStatus(item, positions[item.id], now).label}</span><ArrowRight size={17} /></button>)}
       </div>
       {settlements.length > 0 && <section className="settlement-history"><div className="section-heading"><h2>Recent settlements</h2><Trophy size={17} /></div>{settlements.map((item) => <div className="settlement-row" key={item.txid}><span className="settlement-icon"><Check size={16} /></span><div><strong>{item.title}</strong><small>{shortHex(item.txid, 10)}</small></div><div className="settlement-amount"><strong>+{(item.amountSats / SATS).toFixed(8)} LBTC</strong><small>{positions[item.predictionId]?.redemptionTxid === item.txid && positions[item.predictionId].redemptionConfirmations < 1 ? 'Confirming' : 'Redeemed'}</small></div></div>)}</section>}
     </main>
@@ -627,7 +558,7 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
       {!connected && <button className="secondary" onClick={connect} disabled={busy !== null}>{busy === 'connect' ? <LoaderCircle className="spin" size={17} /> : <WalletCards size={17} />}Connect Humid</button>}
       {isFundedPrediction && <><div className="stage-list" aria-label="Position progress">
         <Stage state={positionStage} label="Position funded" value={positionStage === 'pending' ? 'Waiting for funding confirmation' : positionStage === 'done' ? shortHex(positionOutpoint) : ''} />
-        {priceTerms ? <>
+        <>
           <Stage
             state={priceClaim ? 'done' : busy === 'price' || priceRequestHash ? 'pending' : 'idle'}
             label="Price proof"
@@ -638,17 +569,11 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
             label={priceSwept ? 'Position closed' : 'Claim payout'}
             value={redemptionTxid ? redemptionConfirmations >= 1 ? priceSwept ? 'Swept to house' : 'Payout confirmed' : 'Waiting for payout confirmation' : busy === 'claim' ? 'Preparing and signing claim' : priceClaim ? 'Ready to sign in Humid' : ''}
           />
-        </> : <>
-          <Stage state={prediction?.resolution ? 'done' : 'idle'} label="Market resolution" value={prediction?.resolution ? formatTime(prediction.resolution.occurred_at) : 'Awaiting outcome'} />
-          <Stage state={tick ? 'done' : busy === 'tick' || tickRequestHash ? 'pending' : 'idle'} label="Oracle verification" value={tick ? formatTime(tick.timestamp) : tickRequestHash ? 'Request submitted' : ''} />
-          <Stage state={redemptionTxid ? redemptionConfirmations >= 1 ? 'done' : 'pending' : 'idle'} label="Settlement" value={redemptionTxid ? shortHex(redemptionTxid) : ''} />
-        </>}
+        </>
       </div>
       {priceTerms && positionConfirmations >= 1 && !priceClaim && !redemptionTxid && <button className="secondary" onClick={requestPrice} disabled={busy !== null || !connected || (!priceRequestHash && !liveQualifies)}>{busy === 'price' ? <LoaderCircle className="spin" size={17} /> : <Radio size={17} />}{busy === 'price' ? 'Waiting for Oracle' : priceRequestHash ? 'Check price request' : 'Request price proof'}</button>}
       {priceTerms && priceClaim && <details className="proof-details"><summary>Oracle proof</summary><span>Signer</span><code>{priceClaim.signedPrice.storm_tree_bloom.branch}</code><span>Verifier</span><code>{priceClaim.voucher.txid}:{priceClaim.voucher.vout}</code>{priceClaim.tick && <><span>Tick</span><code>{priceClaim.tick.txid}:{priceClaim.tick.vout}</code><span>Tick time</span><code>{formatTime(priceClaim.tick.amount_sats)}</code><span>Extended price validity</span><code>{formatTime(Number(decodePriceData(priceClaim.signedPrice.price_data).validUntil) + PRICE_VALIDITY_EXTENSION_SECONDS)}</code></>}</details>}
       {priceTerms && priceClaim && !redemptionTxid && <button className="primary" onClick={claimPrice} disabled={busy !== null || !connected}>{busy === 'claim' ? <LoaderCircle className="spin" size={17} /> : <Trophy size={17} />}Sign and claim</button>}
-      {prediction?.resolution && positionConfirmations >= 1 && !tick && <button className="secondary" onClick={requestTick} disabled={busy !== null || !connected}>{busy === 'tick' ? <LoaderCircle className="spin" size={17} /> : <Radio size={17} />}{busy === 'tick' ? 'Waiting for Oracle' : tickRequestHash ? 'Check Oracle request' : 'Request winning Tick'}</button>}
-      {positionConfirmations >= 1 && spendPlan && !redemptionTxid && <button className="primary" onClick={redeem} disabled={busy !== null || !connected}>{busy === 'redeem' ? <LoaderCircle className="spin" size={17} /> : <Trophy size={17} />}Sign and redeem</button>}
       {redemptionTxid && <div className="win-block">{redemptionConfirmations >= 1 ? <Trophy size={20} /> : <LoaderCircle className="spin" size={20} />}<div><strong>{redemptionConfirmations >= 1 ? priceSwept ? 'Position swept to house' : 'Position redeemed' : 'Settlement confirming'}</strong><span>{shortHex(redemptionTxid)}</span></div></div>}</>}
     </aside>
     {notice && <div className={`notice ${notice.kind}`} role={notice.kind === 'error' ? 'alert' : 'status'}><span>{notice.message}</span><button title="Dismiss notification" onClick={() => setNotice(null)}><X size={16} /></button></div>}
@@ -660,13 +585,10 @@ function Stage({ state, label, value }: { state: StageState; label: string; valu
 }
 
 function AdminView({ predictions, refresh, config }: { predictions: Prediction[]; refresh: () => Promise<void>; config: ServerConfig }) {
-  const coordinatorApi = config.oracle_url ?? defaultCoordinatorApi
+  const coordinatorApi = config.oracle_url
   const [token, setToken] = useState(sessionStorage.getItem('admin-token') ?? '')
   const [login, setLogin] = useState('')
   const [password, setPassword] = useState('')
-  const [title, setTitle] = useState('')
-  const [deadline, setDeadline] = useState('')
-  const [occurrences, setOccurrences] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<Notice | null>(null)
   useAutoDismiss(notice, setNotice)
@@ -679,25 +601,9 @@ function AdminView({ predictions, refresh, config }: { predictions: Prediction[]
     } catch (error) { setNotice({ kind: 'error', message: error instanceof Error ? error.message : 'Login failed' }) } finally { setBusy(false) }
   }
 
-  async function createPrediction(event: React.FormEvent) {
-    event.preventDefault(); setBusy(true)
-    try {
-      await json('/api/admin/predictions', { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ title, deadline: Math.floor(new Date(deadline).getTime() / 1000) }) })
-      setTitle(''); setDeadline(''); await refresh(); setNotice({ kind: 'success', message: 'Prediction published.' })
-    } catch (error) { setNotice({ kind: 'error', message: error instanceof Error ? error.message : 'Create failed' }) } finally { setBusy(false) }
-  }
+  if (!token) return <form className="login-panel" onSubmit={authenticate}><div className="login-icon"><LogIn size={22} /></div><span className="eyebrow">Restricted</span><h2>Operator access</h2><label>Login<input autoComplete="username" value={login} onChange={(event) => setLogin(event.target.value)} /></label><label>Password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><button className="primary" disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}Sign in</button>{notice && <div className={`notice inline ${notice.kind}`}>{notice.message}</div>}</form>
 
-  async function resolve(prediction: Prediction) {
-    setBusy(true)
-    try {
-      await json(`/api/admin/predictions/${prediction.id}/resolve`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ occurred_at: Math.floor(new Date(occurrences[prediction.id]).getTime() / 1000) }) })
-      await refresh(); setNotice({ kind: 'success', message: 'Signed resolution published.' })
-    } catch (error) { setNotice({ kind: 'error', message: error instanceof Error ? error.message : 'Resolution failed' }) } finally { setBusy(false) }
-  }
-
-  if (!token) return <form className="login-panel" onSubmit={authenticate}><div className="login-icon"><LogIn size={22} /></div><span className="eyebrow">Restricted</span><h2>Operator access</h2><label>Login<input value={login} onChange={(event) => setLogin(event.target.value)} /></label><label>Password<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label><button className="primary" disabled={busy}>Sign in</button>{notice && <div className={`notice inline ${notice.kind}`}>{notice.message}</div>}</form>
-
-  return <div className="admin-workspace"><div className="admin-heading"><div><span className="eyebrow">Operations</span><h1>Market desk</h1></div><button className="secondary compact" onClick={() => { sessionStorage.removeItem('admin-token'); setToken('') }}><LogOut size={16} />Sign out</button></div><section className="admin-create"><span className="eyebrow">New event market</span><h2>Publish a prediction</h2><form onSubmit={createPrediction}><label>Question<input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Will the event occur?" maxLength={240} /></label><label>Deadline<input type="datetime-local" value={deadline} onChange={(event) => setDeadline(event.target.value)} /></label><button className="primary" disabled={busy || !title || !deadline}><Plus size={17} /> Publish prediction</button></form></section><PriceDesk token={token} predictions={predictions} refresh={refresh} serverApi={serverApi} coordinatorApi={coordinatorApi} chainBackend={chainBackend} config={config} /><section className="resolution-table"><div className="section-heading"><div><span className="eyebrow">Resolution desk</span><h2>Predictions</h2></div><span className="count">{predictions.length}</span></div>{predictions.map((prediction) => <div className="resolution-row" key={prediction.id}><div><strong>{prediction.title}</strong><span>{shortHex(prediction.id)} · {formatTime(prediction.deadline)}</span></div>{prediction.price ? <span className="signed"><ShieldCheck size={14} />Oracle price</span> : prediction.resolution ? <span className="signed"><Check size={14} /> Signed {formatTime(prediction.resolution.occurred_at)}</span> : <><input type="datetime-local" aria-label={`Occurrence time for ${prediction.title}`} value={occurrences[prediction.id] ?? ''} onChange={(event) => setOccurrences({ ...occurrences, [prediction.id]: event.target.value })} /><button className="secondary compact" disabled={busy || !occurrences[prediction.id]} onClick={() => resolve(prediction)}><Check size={15} />Resolve Yes</button></>}</div>)}</section>{notice && <div className={`notice ${notice.kind}`} role="status">{notice.message}</div>}</div>
+  return <div className="admin-workspace"><div className="admin-heading"><div><span className="eyebrow">Operations</span><h1>Market desk</h1></div><button className="secondary compact" onClick={() => { sessionStorage.removeItem('admin-token'); setToken('') }}><LogOut size={16} />Sign out</button></div><PriceDesk token={token} predictions={predictions} refresh={refresh} serverApi={serverApi} coordinatorApi={coordinatorApi} chainBackend={chainBackend} config={config} />{notice && <div className={`notice ${notice.kind}`} role="status">{notice.message}</div>}</div>
 }
 
 function App() {

@@ -1,7 +1,11 @@
 import { Buffer } from "buffer";
-import { address, CreatorOutput } from "liquidjs-lib";
+import { address, bip341, CreatorOutput } from "liquidjs-lib";
+import * as ecc from "@bitcoinerlab/secp256k1";
 import {
   decodePriceData,
+  deriveAccount,
+  type AccountVerification,
+  type OracleNetwork,
   type OracleAccount,
   type SignedPriceData,
 } from "@price-oracle/sdk";
@@ -38,6 +42,81 @@ export type PriceClaim = {
 };
 
 export const PRICE_VALIDITY_EXTENSION_SECONDS = 55 * 60;
+
+export type OracleVerification = AccountVerification & {
+  stormTreeRoot: string;
+};
+
+export async function loadOracleVerification(
+  serverApi: string,
+  wallet: HumidWallet,
+  network: OracleNetwork,
+): Promise<OracleVerification> {
+  const response = await fetch(`${serverApi}/api/oracle/verification`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      owner_public_key: wallet.publicKey.slice(2),
+      auth_script_pubkey: wallet.scriptPubKey,
+    }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  const context = (await response.json()) as OracleVerification & {
+    error?: string;
+  };
+  if (!response.ok)
+    throw new Error(context.error ?? "Oracle verification unavailable");
+  if (
+    context.ownerPublicKey !== wallet.publicKey.slice(2) ||
+    context.authScriptPubKey !== wallet.scriptPubKey ||
+    context.network !== network ||
+    !/^[0-9a-f]{64}$/i.test(context.stormTreeRoot)
+  )
+    throw new Error(
+      "Oracle verification context does not match this wallet and chain",
+    );
+  deriveAccount(context);
+  return context;
+}
+
+export function verifyMarketAssets(
+  market: PriceMarket,
+  context: AccountVerification,
+): void {
+  if (
+    market.storm_eye_asset_id !== context.stormEyeAssetId ||
+    market.tick_asset_id !== context.tickAssetId ||
+    market.verifier_asset_id !== context.verifierAssetId
+  )
+    throw new Error("Market assets do not match the trusted oracle deployment");
+}
+
+export function verifyIssuedPriceOutputs(
+  price: SignedPriceData,
+  voucher: ExplicitUtxo,
+  tick: ExplicitUtxo,
+  context: AccountVerification,
+): void {
+  const branch = price.storm_tree_bloom.branch;
+  if (!/^[0-9a-f]{64}$/i.test(branch))
+    throw new Error("Invalid Verifier branch");
+  const expected = bip341
+    .BIP341Factory(ecc)
+    .taprootOutputScript(Buffer.from(`02${branch}`, "hex"), {
+      hash: Buffer.from(context.tickTapleafHash, "hex"),
+    })
+    .toString("hex");
+  if (
+    voucher.asset !== context.verifierAssetId ||
+    voucher.amount_sats !== 1 ||
+    voucher.script_pubkey !== expected ||
+    tick.script_pubkey !== deriveAccount(context).tick_script_pubkey ||
+    !meetsPriceTick(price, tick, context.tickAssetId)
+  )
+    throw new Error(
+      "Issued Verifier and Tick do not match the trusted context",
+    );
+}
 
 export function meetsPriceTick(
   price: SignedPriceData,

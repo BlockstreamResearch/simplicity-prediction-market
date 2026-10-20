@@ -9,6 +9,4 @@ simplex.workspace = true
 price-oracle-contracts = { package = "contracts", path = "../../price-oracle/contracts" }
 
 [dev-dependencies]
-anyhow.workspace = true
-sha2.workspace = true
 price-feed = { path = "../../price-oracle/price-feed" }

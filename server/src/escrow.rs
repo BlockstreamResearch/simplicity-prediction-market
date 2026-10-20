@@ -1,4 +1,5 @@
 use super::*;
+use simplex::simplicityhl::elements::bitcoin::hashes::Hash as _;
 use simplex::simplicityhl::elements::pset::{Input, Output, PartiallySignedTransaction as Pset};
 use simplex::simplicityhl::elements::secp256k1_zkp::{
     Message as ZkpMessage, PublicKey as ZkpPublicKey, SecretKey as ZkpSecretKey,
@@ -15,11 +16,11 @@ pub(super) struct LocalWallet {
 }
 
 impl LocalWallet {
-    pub(super) async fn load(
-        path: &Path,
-        network: SimplicityNetwork,
-        admin_key: &[u8; 32],
-    ) -> Result<Self, AppError> {
+    pub(super) fn script_pubkey(&self) -> Script {
+        self.address.script_pubkey()
+    }
+
+    pub(super) async fn load(path: &Path, network: SimplicityNetwork) -> Result<Self, AppError> {
         use tokio::io::AsyncWriteExt;
 
         let contents = match tokio::fs::read_to_string(path).await {
@@ -47,9 +48,6 @@ impl LocalWallet {
         let bytes = hex::decode(contents.trim()).map_err(|_| AppError::InvalidEscrowKey)?;
         let secret_key =
             ZkpSecretKey::from_slice(&bytes).map_err(|_| AppError::InvalidEscrowKey)?;
-        if secret_key.secret_bytes() == *admin_key {
-            return Err(AppError::InvalidEscrowKey);
-        }
         Ok(Self::new(secret_key, network))
     }
 
@@ -109,7 +107,7 @@ impl LocalWallet {
             .to_vec();
         signature.push(1);
         pset.inputs_mut()[index].final_script_witness =
-            Some(vec![signature, self.public_key.to_bytes()]);
+            Some(vec![signature, self.public_key.to_bytes()].into());
         Ok(())
     }
 
@@ -145,7 +143,7 @@ impl LocalWallet {
                 let (key, signature) = input.partial_sigs.iter().find(|(key, _)| {
                     Address::p2wpkh(key, None, self.address.params).script_pubkey() == source.script_pubkey
                 }).ok_or_else(|| ApiError::bad_request("Humid must sign all holder funding inputs before the host can open escrow"))?;
-                vec![signature.clone(), key.to_bytes()]
+                vec![signature.clone(), key.to_bytes()].into()
             };
             if witness.len() != 2 || witness[0].last() != Some(&1) || witness[1].len() != 33 {
                 return Err(ApiError::bad_request(
@@ -674,16 +672,8 @@ pub(super) async fn prepare(
         .checked_mul(2)
         .ok_or_else(|| ApiError::bad_request("escrow amount overflows"))?;
     let now = unix_time()?;
-    let market = state
-        .store
-        .read()
-        .await
-        .predictions
-        .iter()
-        .find(|market| market.id == id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found("prediction does not exist"))?;
-    if market.deadline <= now || market.resolution.is_some() {
+    let market = find_prediction(&state, &id).await?;
+    if market.deadline <= now {
         return Err(ApiError::conflict(
             "prediction is no longer open for escrow funding",
         ));
@@ -897,11 +887,11 @@ pub(super) async fn commit(
             "escrow funding proposal does not match this prediction or has expired",
         ));
     }
-    let open = state.store.read().await.predictions.iter().any(|market| {
-        market.id == id
-            && market.deadline > unix_time().unwrap_or(u64::MAX)
-            && market.resolution.is_none()
-    });
+    let open = state
+        .db
+        .find(&id)
+        .await?
+        .is_some_and(|market| market.deadline > unix_time().unwrap_or(u64::MAX));
     if !open {
         return Err(ApiError::conflict(
             "prediction closed before escrow funding was signed",
@@ -1019,13 +1009,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_key_file_is_persistent_and_separate_from_admin_key() {
+    async fn local_key_file_is_persistent_and_rejects_invalid_keys() {
         let directory = std::env::temp_dir().join(format!("escrow-key-{}", Uuid::new_v4()));
         let path = directory.join("reserve.key");
-        let first = LocalWallet::load(&path, SimplicityNetwork::LiquidTestnet, &[0x11; 32])
+        let first = LocalWallet::load(&path, SimplicityNetwork::LiquidTestnet)
             .await
             .unwrap();
-        let second = LocalWallet::load(&path, SimplicityNetwork::LiquidTestnet, &[0x11; 32])
+        let second = LocalWallet::load(&path, SimplicityNetwork::LiquidTestnet)
             .await
             .unwrap();
         assert_eq!(first.address, second.address);
@@ -1043,14 +1033,11 @@ mod tests {
                 0o600
             );
         }
+        tokio::fs::write(&path, "invalid").await.unwrap();
         assert!(
-            LocalWallet::load(
-                &path,
-                SimplicityNetwork::LiquidTestnet,
-                &first.secret_key.secret_bytes()
-            )
-            .await
-            .is_err()
+            LocalWallet::load(&path, SimplicityNetwork::LiquidTestnet)
+                .await
+                .is_err()
         );
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
@@ -1068,9 +1055,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("local-escrow-{}", Uuid::new_v4()));
         let key_path = directory.join("reserve.key");
         let network = SimplicityNetwork::LiquidTestnet;
-        let wallet = LocalWallet::load(&key_path, network, &[0x11; 32])
-            .await
-            .unwrap();
+        let wallet = LocalWallet::load(&key_path, network).await.unwrap();
         let holder = LocalWallet::new(ZkpSecretKey::from_slice(&[2; 32]).unwrap(), network);
         let policy = network.policy_asset();
         let source = TxOut {
@@ -1084,7 +1069,7 @@ mod tests {
             version: 2,
             lock_time: simplex::simplicityhl::elements::LockTime::ZERO,
             input: vec![simplex::simplicityhl::elements::TxIn {
-                previous_output: OutPoint::new(Txid::all_zeros(), 0),
+                previous_output: OutPoint::new(Txid::from_byte_array([0; 32]), 0),
                 ..Default::default()
             }],
             output: vec![
@@ -1132,6 +1117,7 @@ mod tests {
         let broadcast_spent = spent.clone();
         let backend =
             Router::new()
+                .merge(super::super::tests::oracle_routes("liquidtestnet"))
                 .route(
                     "/block-height/0",
                     get(move || async move { network.genesis_block_hash().to_string() }),
@@ -1182,10 +1168,11 @@ mod tests {
                     }),
                 );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = super::super::tests::config(directory.join("markets.json"));
+        let mut config = super::super::tests::config();
         config.policy_asset_id = policy.to_string();
         config.genesis_block_hash = network.genesis_block_hash().to_string();
         config.chain_backend.esplora_url = format!("http://{}", listener.local_addr().unwrap());
+        config.oracle_url = config.chain_backend.esplora_url.clone();
         config.chain_backend.rpc_url.clear();
         config.escrow = Some(EscrowConfig {
             wallet: String::new(),
@@ -1195,10 +1182,9 @@ mod tests {
         let task = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
         let app = App::new(config).await.unwrap();
         app.state
-            .store
+            .sessions
             .write()
             .await
-            .sessions
             .insert("admin-session".into(), unix_time().unwrap() + 3600);
         let admin_request = || {
             Request::builder()
@@ -1233,15 +1219,18 @@ mod tests {
         assert!(response.0.matched_escrow_enabled);
 
         let id = "77".repeat(32);
-        app.state.store.write().await.predictions.push(Prediction {
-            id: id.clone(),
-            title: "Local signer".into(),
-            deadline: unix_time().unwrap() + 3600,
-            created_at: unix_time().unwrap(),
-            resolution: None,
-            price: None,
-        });
-        let parameters = serde_json::json!({ "payout_script_pubkey": hex::encode(holder.address.script_pubkey().as_bytes()), "tick_asset_id": "33".repeat(32), "tick_script_pubkey": "51" });
+        app.state
+            .db
+            .insert(&Prediction {
+                id: id.clone(),
+                title: "Local signer".into(),
+                deadline: unix_time().unwrap() + 3600,
+                created_at: unix_time().unwrap(),
+                price: super::super::tests::price_terms(),
+            })
+            .await
+            .unwrap();
+        let parameters = serde_json::json!({ "payout_script_pubkey": hex::encode(holder.address.script_pubkey().as_bytes()), "tick_script_pubkey": "51", "owner_public_key": crate::tests::HOLDER_PUBLIC_KEY });
         let derived = derive_contract(
             State(app.state.clone()),
             AxumPath(id.clone()),
@@ -1558,7 +1547,7 @@ mod tests {
         let reserve_hex = hex::encode(simplex::simplicityhl::elements::encode::serialize(
             &reserve_tx,
         ));
-        let backend = Router::new().route("/wallet/host", post(move |Json(request): Json<serde_json::Value>| {
+        let backend = Router::new().merge(super::super::tests::oracle_routes("elementsregtest")).route("/wallet/host", post(move |Json(request): Json<serde_json::Value>| {
             let reserve_hex = reserve_hex.clone();
             async move {
                 let result = match request["method"].as_str().unwrap() {
@@ -1580,10 +1569,9 @@ mod tests {
             }
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = super::super::tests::config(
-            std::env::temp_dir().join(format!("escrow-{}.json", Uuid::new_v4())),
-        );
+        let mut config = super::super::tests::config();
         config.chain_backend.rpc_url = format!("http://{}", listener.local_addr().unwrap());
+        config.oracle_url = config.chain_backend.rpc_url.clone();
         config.escrow = Some(EscrowConfig {
             wallet: "host".into(),
             private_key_file: None,
@@ -1592,15 +1580,18 @@ mod tests {
         let task = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
         let app = App::new(config).await.unwrap();
         let id = "77".repeat(32);
-        app.state.store.write().await.predictions.push(Prediction {
-            id: id.clone(),
-            title: "Matched event".into(),
-            created_at: unix_time().unwrap(),
-            deadline: unix_time().unwrap() + 3600,
-            resolution: None,
-            price: None,
-        });
-        let parameters = serde_json::json!({ "payout_script_pubkey": hex::encode(wallet_script.as_bytes()), "tick_asset_id": "33".repeat(32), "tick_script_pubkey": "51" });
+        app.state
+            .db
+            .insert(&Prediction {
+                id: id.clone(),
+                title: "Matched price market".into(),
+                created_at: unix_time().unwrap(),
+                deadline: unix_time().unwrap() + 3600,
+                price: super::super::tests::price_terms(),
+            })
+            .await
+            .unwrap();
+        let parameters = serde_json::json!({ "payout_script_pubkey": hex::encode(wallet_script.as_bytes()), "tick_script_pubkey": "51", "owner_public_key": crate::tests::HOLDER_PUBLIC_KEY });
         let derived = derive_contract(
             State(app.state.clone()),
             AxumPath(id.clone()),
@@ -1657,7 +1648,7 @@ mod tests {
             let response = app.router().oneshot(request(&format!("/api/predictions/{id}/escrow/commit"), serde_json::json!({ "funding_id": body["funding_id"], "pset": pset.to_string() }))).await.unwrap();
             assert_eq!(response.status(), expected);
         }
-        app.state.store.write().await.predictions[0].deadline = 0;
+        app.state.db.set_deadline(&id, 0).await.unwrap();
         let response = app.router().oneshot(request(&format!("/api/predictions/{id}/escrow/commit"), serde_json::json!({ "funding_id": body["funding_id"], "pset": matched.to_string() }))).await.unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
         task.abort();
@@ -1669,8 +1660,8 @@ mod tests {
         let mut config = Config::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml"))
             .await
             .unwrap();
-        config.data_file =
-            std::env::temp_dir().join(format!("live-escrow-{}.json", Uuid::new_v4()));
+        config.database_url = "sqlite::memory:".into();
+        config.database_max_connections = 1;
         let app = App::new(config).await.unwrap();
         assert_eq!(
             rpc(&app.state, "getblockchaininfo", serde_json::json!([]))
@@ -1725,20 +1716,27 @@ mod tests {
             .unwrap();
         let payout = parse_script(info["scriptPubKey"].as_str().unwrap(), "holder").unwrap();
         let id = hex::encode(Sha256::digest(Uuid::new_v4().as_bytes()));
-        app.state.store.write().await.predictions.push(Prediction {
-            id: id.clone(),
-            title: "Live escrow verification".into(),
-            created_at: unix_time().unwrap(),
-            deadline: unix_time().unwrap() + 3600,
-            resolution: None,
-            price: None,
-        });
+        let account = price::account(&app.state, crate::tests::HOLDER_PUBLIC_KEY)
+            .await
+            .unwrap();
+        let mut terms = super::super::tests::price_terms();
+        terms.tick_asset_id = account.tick_asset_id;
+        terms.verifier_asset_id = account.oracle_verifier_asset_id;
+        terms.storm_eye_asset_id = account.storm_eye_asset_id;
+        app.state
+            .db
+            .insert(&Prediction {
+                id: id.clone(),
+                title: "Live escrow verification".into(),
+                created_at: unix_time().unwrap(),
+                deadline: unix_time().unwrap() + 3600,
+                price: terms,
+            })
+            .await
+            .unwrap();
         let parameters = || DeriveContractRequest {
             payout_script_pubkey: hex::encode(payout.as_bytes()),
-            tick_asset_id: "33".repeat(32),
-            tick_script_pubkey: "51".into(),
-            confidential_payout: false,
-            owner_public_key: None,
+            owner_public_key: Some(crate::tests::HOLDER_PUBLIC_KEY.into()),
         };
         let derived = derive_contract(
             State(app.state.clone()),

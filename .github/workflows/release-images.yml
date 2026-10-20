@@ -1,0 +1,210 @@
+name: Publish release images
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: release-images-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+env:
+  PRICE_ORACLE_REF: ${{ vars.PRICE_ORACLE_REF }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: server
+            suffix: server
+            dockerfile: prediction-demo/server/Dockerfile
+            title: Signal Market server
+            platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - name: server
+            suffix: server
+            dockerfile: prediction-demo/server/Dockerfile
+            title: Signal Market server
+            platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - name: web
+            suffix: web
+            dockerfile: prediction-demo/web/Dockerfile
+            title: Signal Market web
+            platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - name: web
+            suffix: web
+            dockerfile: prediction-demo/web/Dockerfile
+            title: Signal Market web
+            platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Require immutable Price Oracle revision
+        shell: bash
+        run: |
+          if [[ ! "$PRICE_ORACLE_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Set the PRICE_ORACLE_REF repository variable to a full oracle commit SHA containing Simplex 0.1.1 and the hardened verification SDK."
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: prediction-demo
+
+      - name: Checkout Price Oracle dependency
+        uses: actions/checkout@v4
+        with:
+          repository: BlockstreamResearch/price-oracle
+          ref: ${{ env.PRICE_ORACLE_REF }}
+          path: price-oracle
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image name
+        id: image
+        shell: bash
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPOSITORY: ${{ github.event.repository.name }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: echo "name=ghcr.io/${OWNER,,}/${REPOSITORY,,}-${SUFFIX}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.title }}
+
+      - name: Build and push image by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          build-args: ${{ matrix.suffix == 'web' && format('VITE_SERVER_API={0}', vars.VITE_SERVER_API || 'http://127.0.0.1:3100') || '' }}
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.suffix }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.suffix }}-${{ matrix.arch }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Export image digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.suffix }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish ${{ matrix.name }} manifest
+    runs-on: ubuntu-latest
+    needs: build
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: server
+            suffix: server
+            title: Signal Market server
+          - name: web
+            suffix: web
+            title: Signal Market web
+
+    steps:
+      - name: Download image digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ matrix.suffix }}-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image name
+        id: image
+        shell: bash
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPOSITORY: ${{ github.event.repository.name }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: echo "name=ghcr.io/${OWNER,,}/${REPOSITORY,,}-${SUFFIX}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.title }}
+          tags: |
+            type=raw,value=${{ github.event.release.tag_name }}
+            type=raw,value=latest,enable=${{ !github.event.release.prerelease }}
+
+      - name: Create and push multi-platform manifest
+        working-directory: /tmp/digests
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          mapfile -t tags < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          tag_args=()
+          for tag in "${tags[@]}"; do
+            tag_args+=(--tag "$tag")
+          done
+
+          source_args=()
+          for digest in *; do
+            source_args+=("${IMAGE}@sha256:${digest}")
+          done
+
+          docker buildx imagetools create "${tag_args[@]}" "${source_args[@]}"
+
+      - name: Inspect published image
+        shell: bash
+        run: docker buildx imagetools inspect "$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")"

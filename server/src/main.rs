@@ -18,6 +18,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(app.listen_address()).await?;
 
     tracing::info!(address = %listener.local_addr()?, "prediction demo server listening");
-    axum::serve(listener, app.router()).await?;
+    tokio::select! {
+        result = async { axum::serve(listener, app.router()).await } => result?,
+        () = app.run_auto_publisher() => {}
+    }
     Ok(())
 }
