@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { expect, test, type Page } from "@playwright/test";
 import { deriveAccount, type AccountVerification } from "@price-oracle/sdk";
 import * as ecc from "@bitcoinerlab/secp256k1";
+import { escrowOwnershipMessage } from "../src/wallet";
 import {
   Creator,
   bip341,
@@ -14,6 +15,20 @@ import {
   PsetInput,
   Transaction,
 } from "liquidjs-lib";
+
+function bitcoinMessageHash(message: string): Buffer {
+  const bytes = Buffer.from(message, "utf8");
+  const length =
+    bytes.length < 253
+      ? Buffer.of(bytes.length)
+      : Buffer.of(253, bytes.length & 255, bytes.length >> 8);
+  const once = createHash("sha256")
+    .update(
+      Buffer.concat([Buffer.from("\x18Bitcoin Signed Message:\n"), length, bytes]),
+    )
+    .digest();
+  return createHash("sha256").update(once).digest();
+}
 
 async function mockOracleVerification(
   page: Page,
@@ -561,6 +576,22 @@ test("new positions lock a host-matched escrow and sign only holder inputs", asy
     const request = route.request().postDataJSON();
     expect(request.stake_sats).toBe(100000);
     const pset = Pset.fromBase64(request.pset);
+    const proof = Buffer.from(request.ownership_proofs[0], "hex");
+    expect(request.ownership_proofs).toHaveLength(1);
+    expect(
+      Buffer.from(
+        ecc.recover(
+          bitcoinMessageHash(
+            escrowOwnershipMessage(market.id, 100000, wallet.scriptPubKey, [
+              { txid: holderTxid, vout: 0 },
+            ]),
+          ),
+          proof.subarray(0, 64),
+          proof[64] as 0 | 1 | 2 | 3,
+          true,
+        )!,
+      ).toString("hex"),
+    ).toBe(wallet.publicKey);
     expect(pset.outputs[0].value).toBe(100000);
     pset.outputs[0].value = 200000;
     const input = new PsetInput(Buffer.alloc(32, 0xcc), 0);
@@ -606,6 +637,8 @@ test("new positions lock a host-matched escrow and sign only holder inputs", asy
           request?: {
             method: string;
             params: {
+              address?: string;
+              message?: string;
               pset?: string;
               broadcast?: boolean;
               signInputs?: Array<{ index: number }>;
@@ -648,6 +681,22 @@ test("new positions lock a host-matched escrow and sign only holder inputs", asy
             },
           ],
         };
+      if (request?.method === "signMessage") {
+        expect(request.params.address).toBe(wallet.address);
+        const signature = ecc.signRecoverable(
+          bitcoinMessageHash(request.params.message!),
+          Buffer.alloc(32, 1),
+        );
+        return {
+          address: request.params.address,
+          protocol: "ecdsa",
+          signatureEncoding: "hex-recoverable-ecdsa-65",
+          signature: Buffer.concat([
+            Buffer.from(signature.signature),
+            Buffer.of(signature.recoveryId),
+          ]).toString("hex"),
+        };
+      }
       if (request?.method === "signPset") {
         expect(request.params.broadcast).toBe(false);
         expect(request.params.signInputs?.map((input) => input.index)).toEqual([

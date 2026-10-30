@@ -9,6 +9,12 @@ const server =
 const coordinator = process.env.TEST_COORDINATOR_API ?? "http://127.0.0.1:9100";
 const stateKey = "signal-market:user-state:v3";
 
+function requiredEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`Set ${name} to the server's admin credentials`);
+  return value;
+}
+
 async function rpc<Result>(
   method: string,
   params: unknown[] = [],
@@ -80,7 +86,14 @@ async function publicState(page: Page) {
   }, stateKey);
 }
 
-test.use({ screenshot: "off", trace: "off", video: "off" });
+// A missing or disabled element fails within 30 seconds and names itself, instead of hanging until
+// the whole test times out.
+test.use({
+  screenshot: "off",
+  trace: "off",
+  video: "off",
+  actionTimeout: 30_000,
+});
 
 test("claims and sweeps price markets with the actual Humid extension", async () => {
   const extension = process.env.TEST_REAL_HUMID_EXTENSION;
@@ -149,10 +162,18 @@ test("claims and sweeps price markets with the actual Humid extension", async ()
         for (let step = 0; step < 8 && !notification.isClosed(); step += 1) {
           const approve = notification
             .getByRole("button", {
-              name: /^(Approve|Connect|Add network|Confirm|Allow|Sign message|Sign transaction|Sign and broadcast)$/i,
+              name: /^(Approve|Connect|Add network|Confirm|Allow|Sign|Sign and send|Sign message|Sign transaction|Sign and broadcast)$/i,
             })
             .last();
-          await approve.waitFor({ timeout: 15_000 });
+          await approve.waitFor({ timeout: 15_000 }).catch(async (error) => {
+            const offered = await notification
+              .getByRole("button")
+              .allTextContents()
+              .catch(() => []);
+            throw new Error(
+              `No known Humid approval button; offered: ${JSON.stringify(offered)} (${error.message})`,
+            );
+          });
           console.log("Humid approval:", await approve.textContent());
           await approve.click();
           await notification
@@ -163,6 +184,20 @@ test("claims and sweeps price markets with the actual Humid extension", async ()
         if (!notification.isClosed()) approvalErrors.push(error.message);
       });
     });
+    app.on("response", async (response) => {
+      if (response.status() >= 400)
+        console.log(
+          "HTTP error:",
+          response.status(),
+          response.request().method(),
+          response.url(),
+          (await response.text().catch(() => "")).slice(0, 300),
+        );
+    });
+    app.on("requestfailed", (request) =>
+      console.log("Request failed:", request.url(), request.failure()?.errorText),
+    );
+    app.on("pageerror", (error) => console.log("Page error:", error.message));
     await app.goto(process.env.VITE_TEST_URL ?? "http://127.0.0.1:5173");
     await app
       .getByRole("region", { name: "Wallet summary" })
@@ -227,47 +262,41 @@ test("claims and sweeps price markets with the actual Humid extension", async ()
     await receive
       .getByRole("button", { name: "Refresh balances", exact: true })
       .click();
-    let reportedUtxos: Array<{
+    type ReportedUtxo = {
       amount: string;
       confidential: boolean;
       spendable: boolean;
       txid: string;
       vout: number;
-    }> = [];
+    };
+    const humidUtxos = () =>
+      app.evaluate(async (wallet) => {
+        const result = await window.humid!.request<{ utxos: ReportedUtxo[] }>({
+          method: "wallet_invokeMethod",
+          params: {
+            scope: wallet.chainId,
+            request: {
+              method: "getUTXOs",
+              params: {
+                assetId: `${wallet.chainId}/elip144:${wallet.policyAssetId}`,
+              },
+            },
+          },
+        });
+        return result.utxos.map(
+          ({ amount, confidential, spendable, txid, vout }) => ({
+            amount,
+            confidential,
+            spendable,
+            txid,
+            vout,
+          }),
+        );
+      }, wallet);
     await expect
       .poll(
         async () => {
-          reportedUtxos = await app.evaluate(async (wallet) => {
-            const result = await window.humid!.request<{
-              utxos: Array<{
-                amount: string;
-                confidential: boolean;
-                spendable: boolean;
-                txid: string;
-                vout: number;
-              }>;
-            }>({
-              method: "wallet_invokeMethod",
-              params: {
-                scope: wallet.chainId,
-                request: {
-                  method: "getUTXOs",
-                  params: {
-                    assetId: `${wallet.chainId}/elip144:${wallet.policyAssetId}`,
-                  },
-                },
-              },
-            });
-            return result.utxos.map(
-              ({ amount, confidential, spendable, txid, vout }) => ({
-                amount,
-                confidential,
-                spendable,
-                txid,
-                vout,
-              }),
-            );
-          }, wallet);
+          const reportedUtxos = await humidUtxos();
           if (reportedUtxos.length)
             console.log("Public funding UTXOs:", JSON.stringify(reportedUtxos));
           return reportedUtxos
@@ -278,14 +307,37 @@ test("claims and sweeps price markets with the actual Humid extension", async ()
         { timeout: 90_000, intervals: [5000] },
       )
       .toBe("180000");
+    // Humid syncs on its own schedule, so after spending, refresh it and wait until the coins it
+    // lists that are still unspent on chain cover the next position, as the app will check.
+    const waitForHumidFunds = async (minimumSats: bigint) => {
+      await receive
+        .getByRole("button", { name: "Refresh balances", exact: true })
+        .click();
+      await expect
+        .poll(
+          async () => {
+            let total = 0n;
+            for (const utxo of await humidUtxos()) {
+              if (!utxo.spendable) continue;
+              const spend = (await (
+                await fetch(`${server}/tx/${utxo.txid}/outspend/${utxo.vout}`)
+              ).json()) as { spent: boolean };
+              if (!spend.spent) total += BigInt(utxo.amount);
+            }
+            return total >= minimumSats;
+          },
+          { timeout: 120_000, intervals: [5000] },
+        )
+        .toBe(true);
+    };
 
     await app.getByRole("button", { name: "Demo", exact: true }).click();
     await app
       .getByLabel("Login", { exact: true })
-      .fill(process.env.TEST_ADMIN_LOGIN ?? "admin");
+      .fill(requiredEnv("TEST_ADMIN_LOGIN"));
     await app
       .getByLabel("Password", { exact: true })
-      .fill(process.env.TEST_ADMIN_PASSWORD ?? "prediction-demo");
+      .fill(requiredEnv("TEST_ADMIN_PASSWORD"));
     await app.getByRole("button", { name: "Sign in", exact: true }).click();
     const desk = app.getByRole("region", { name: "Price market publishing" });
     const connectHouse = async () => {
@@ -312,11 +364,12 @@ test("claims and sweeps price markets with the actual Humid extension", async ()
       deadline: number,
       grace: number,
     ) => {
+      console.log("Step: publish", title);
       await desk.getByLabel("Question", { exact: true }).fill(title);
       await desk.getByLabel("Strike", { exact: true }).fill(strike);
       await desk
         .getByLabel("Opens", { exact: true })
-        .fill(localDate(Date.now() - 60_000));
+        .fill(localDate(Date.now()));
       await desk
         .getByLabel("Deadline", { exact: true })
         .fill(localDate(deadline));
@@ -329,6 +382,7 @@ test("claims and sweeps price markets with the actual Humid extension", async ()
       ).toBeVisible();
     };
     const lock = async (title: string) => {
+      console.log("Step: lock", title);
       await app
         .getByRole("button", { name: "Back to Markets", exact: true })
         .click();
@@ -338,20 +392,45 @@ test("claims and sweeps price markets with the actual Humid extension", async ()
       await app.locator(".market-row").filter({ hasText: title }).click();
       await app.getByLabel("Stake, LBTC", { exact: true }).fill("0.0005");
       const previous = (await publicState(app)).positionOutpoint;
+      console.log(
+        "Wallet summary before lock:",
+        JSON.stringify(
+          await app
+            .getByRole("region", { name: "Wallet summary" })
+            .getByRole("button")
+            .allTextContents(),
+        ),
+        "notices:",
+        JSON.stringify(await app.locator(".notice").allTextContents()),
+      );
       await app
         .getByRole("button", { name: "Participate", exact: true })
         .click();
       await expect
-        .poll(async () => (await publicState(app)).positionOutpoint)
+        .poll(
+          async () => {
+            const notice = await app
+              .locator(".notice.error")
+              .allTextContents();
+            if (notice.length || approvalErrors.length)
+              throw new Error(
+                `Lock failed: ${JSON.stringify({ notice, approvalErrors })}`,
+              );
+            return (await publicState(app)).positionOutpoint;
+          },
+          { timeout: 120_000 },
+        )
         .not.toBe(previous);
       await mine();
       return (await publicState(app)).positionOutpoint as string;
     };
     await publish(winner, strike, Date.now() + 3600_000, 600);
     const claimPosition = await lock(winner);
+    // A proof needs an oracle price received after the market opened; the feed updates about
+    // once a minute.
     await expect(
       app.getByRole("button", { name: "Request price proof", exact: true }),
-    ).toBeEnabled();
+    ).toBeEnabled({ timeout: 120_000 });
     await app
       .getByRole("button", { name: "Request price proof", exact: true })
       .click();
@@ -385,6 +464,8 @@ test("claims and sweeps price markets with the actual Humid extension", async ()
       await rpc("gettxout", [claimFunding, Number(claimIndex)]),
     ).toBeNull();
 
+    // Stake, oracle fee and transaction fees for the second position.
+    await waitForHumidFunds(50_000n + 10_000n + 3_000n + 1n);
     await app.getByRole("button", { name: "Demo", exact: true }).click();
     await connectHouse();
     await publish(loser, "1000000000", Date.now() + 60_000, 1);
@@ -404,6 +485,8 @@ test("claims and sweeps price markets with the actual Humid extension", async ()
         exact: true,
       }),
     ).toBeEnabled({ timeout: 75_000 });
+    // The expiry Tick fee comes from the same Humid wallet that just funded the position.
+    await waitForHumidFunds(13_001n);
     await sweepDesk
       .getByRole("button", { name: "Request expiry Tick", exact: true })
       .click();
@@ -414,7 +497,20 @@ test("claims and sweeps price markets with the actual Humid extension", async ()
         ),
       );
     await expect
-      .poll(async () => (await houseState()).feeOutpoint ?? "")
+      .poll(
+        async () => {
+          const notice = [
+            ...(await app.locator(".notice.error").allTextContents()),
+            ...(await app.locator(".price-desk-notice").allTextContents()),
+          ].filter((text) => text !== "Price market published.");
+          if (notice.length || approvalErrors.length)
+            throw new Error(
+              `Expiry Tick request failed: ${JSON.stringify({ notice, approvalErrors })}`,
+            );
+          return (await houseState()).feeOutpoint ?? "";
+        },
+        { timeout: 120_000 },
+      )
       .not.toBe("");
     await mine();
     await expect
@@ -431,8 +527,9 @@ test("claims and sweeps price markets with the actual Humid extension", async ()
     const sweepTxid = (await houseState()).txid;
     await mine();
     const sweep = await (await fetch(`${server}/tx/${sweepTxid}`)).json();
+    // The sweep returns the whole matched escrow: the bettor's stake plus the host's match.
     expect(sweep.vout[0]).toMatchObject({
-      value: 50000,
+      value: 100000,
       scriptpubkey: wallet.scriptPubKey,
     });
     expect(sweep.vout[1].scriptpubkey).toBe("6a0400000001");

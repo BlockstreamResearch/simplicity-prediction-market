@@ -161,6 +161,7 @@ async fn publish_scheduled(state: &AppState, now: u64) -> Result<bool, ApiError>
             house_script_pubkey: hex::encode(wallet.script_pubkey().as_bytes()),
         },
         deadline,
+        now,
     )
     .await?;
     if price.decimals != data.decimals {
@@ -350,11 +351,21 @@ pub(super) async fn feed(
     ))
 }
 
+/// How far in the past a manually chosen price window may open, to absorb admin clock skew.
+const PUBLISH_CLOCK_SKEW_SECONDS: u64 = 60;
+
 pub(super) async fn publish(
     state: &AppState,
     request: PriceMarketRequest,
     deadline: u64,
+    now: u64,
 ) -> Result<PriceMarket, ApiError> {
+    // A window that opened in the past could admit prices that already met the strike.
+    if request.opens_at.saturating_add(PUBLISH_CLOCK_SKEW_SECONDS) < now {
+        return Err(ApiError::bad_request(
+            "price window must not open in the past",
+        ));
+    }
     if request.opens_at >= deadline
         || request.claim_grace < 1
         || request.claim_grace > 3600
@@ -1672,17 +1683,22 @@ mod tests {
         };
         let body = serde_json::json!({ "title": "Oracle touch", "deadline": now + 3600, "price": { "feed_id": 0, "strike": "10000000000", "above": true, "opens_at": now, "claim_grace": 600,
             "house_script_pubkey": terms().house_script_pubkey } });
-        let mut invalid = body.clone();
-        invalid["price"]["feed_id"] = serde_json::json!(999);
-        assert_eq!(
-            router
-                .clone()
-                .oneshot(request("/api/admin/predictions", invalid))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::BAD_REQUEST
-        );
+        let mut unsupported = body.clone();
+        unsupported["price"]["feed_id"] = serde_json::json!(999);
+        // A window that already opened could admit prices from before publication.
+        let mut opened = body.clone();
+        opened["price"]["opens_at"] = serde_json::json!(now - 3600);
+        for invalid in [unsupported, opened] {
+            assert_eq!(
+                router
+                    .clone()
+                    .oneshot(request("/api/admin/predictions", invalid))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
         let response = router
             .clone()
             .oneshot(request("/api/admin/predictions", body))

@@ -15,7 +15,7 @@ import {
   type OracleUtxo, type PriceFeedInfo, type PriceFeedRate,
 } from '@price-oracle/sdk'
 import './App.css'
-import { addWalletInputDerivation, createFundingPset, EsploraClient, hydrateFundingPset, selectFundingUtxos, verifyMatchedEscrow } from './wallet'
+import { addWalletInputDerivation, createFundingPset, escrowOwnershipMessage, EsploraClient, hydrateFundingPset, selectFundingUtxos, verifyMatchedEscrow } from './wallet'
 import { connectHumid, getHumidUtxos, HumidNotDetectedError, revokeHumidSession, sameHumidWallet, signHumidMessage, signHumidPset, signAndBroadcastHumidPset,
   subscribeToHumidChanges, validateHumidSession, type HumidWallet, type HumidUtxo } from './humid'
 import { displayPrice, fundOracleRequest, loadOracleVerification, meetsMarket, meetsPriceTick, PRICE_VALIDITY_EXTENSION_SECONDS, verifyIssuedPriceOutputs, verifyMarketAssets, waitForOutput, type PriceClaim, type PriceMarket } from './price-market'
@@ -235,10 +235,13 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
       const verified = await new PriceOracleClient(coordinatorApi).getAccount(wallet.publicKey.slice(2), verification)
       if (!cancelled) { setAccount(verified); setWalletScript(wallet.scriptPubKey); setConnected(true) }
     }
-    void restore().catch((error: unknown) => {
+    const revalidate = () => void restore().catch((error: unknown) => {
       if (!cancelled) { setConnected(false); setNotice({ kind: 'error', message: error instanceof Error ? error.message : 'Account verification failed' }) }
     })
-    const unsubscribe = subscribeToHumidChanges(() => { if (!cancelled) setConnected(false) })
+    revalidate()
+    // Humid also reports session changes made elsewhere, such as the Market desk connecting the
+    // house wallet, so recheck the session instead of assuming this wallet was disconnected.
+    const unsubscribe = subscribeToHumidChanges(() => { if (!cancelled) revalidate() })
     return () => { cancelled = true; unsubscribe() }
   }, [wallet, config.genesis_block_hash, config.network, coordinatorApi])
 
@@ -383,9 +386,14 @@ function UserView({ predictions, refresh, config, walletSlot }: { predictions: P
       outputs.push(new CreatorOutput(policyAsset, TRANSACTION_FEE, Buffer.alloc(0)))
       const unsigned = createFundingPset(inputs, outputs)
       await hydrateFundingPset(unsigned, fundingInputs, chain)
+      const ownership = escrowOwnershipMessage(prediction.id, stakeSats, walletScript, inputs)
+      const proofsByAddress = new Map<string, string>()
+      for (const input of fundingInputs)
+        if (!proofsByAddress.has(input.address)) proofsByAddress.set(input.address, await signHumidMessage(wallet, ownership, input.address))
       const funding = await json<{ funding_id: string; pset: string; escrow_sats: number }>(`/api/predictions/${prediction.id}/escrow`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ pset: unsigned.toBase64(), stake_sats: stakeSats, contract: contractRequest }),
+        body: JSON.stringify({ pset: unsigned.toBase64(), stake_sats: stakeSats, contract: contractRequest,
+          ownership_proofs: fundingInputs.map((input) => proofsByAddress.get(input.address)!) }),
       })
       pendingFundingId = funding.funding_id
       const matched = Pset.fromBase64(funding.pset)

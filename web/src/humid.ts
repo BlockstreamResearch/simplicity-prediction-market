@@ -363,6 +363,7 @@ export async function getHumidUtxos(wallet: HumidWallet): Promise<HumidUtxo[]> {
 export async function signHumidMessage(
   wallet: HumidWallet,
   message: string,
+  address = wallet.address,
 ): Promise<string> {
   if (!(await validateHumidSession(wallet)))
     throw new Error("Reconnect Humid before signing");
@@ -372,12 +373,12 @@ export async function signHumidMessage(
     signatureEncoding: string;
     signature: string;
   }>(wallet, "signMessage", {
-    address: wallet.address,
+    address,
     protocol: "ecdsa",
     message,
   });
   if (
-    result.address !== wallet.address ||
+    result.address !== address ||
     result.protocol !== "ecdsa" ||
     result.signatureEncoding !== "hex-recoverable-ecdsa-65" ||
     !/^[0-9a-f]{130}$/i.test(result.signature)
