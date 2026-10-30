@@ -338,3 +338,109 @@ fn tick_claim_preserves_price_verifier_and_payout_checks() {
         );
     }
 }
+
+/// Spends two equal-valued expired positions in one sweep transaction.
+/// `house_outputs[i]` is the output index that position input `i` names as its house payout.
+/// Output 1 goes to the house only when `second_to_house` is true; otherwise it pays an
+/// unrelated script (the attacker in the XF-02 scenario).
+fn sweep_two_positions(house_outputs: [u32; 2], second_to_house: bool) -> [bool; 2] {
+    let asset = |byte| AssetId::from_byte_array([byte; 32]);
+    let network = SimplicityNetwork::ElementsCustom {
+        policy_asset: asset(0x66),
+        genesis_hash: BlockHash::from_byte_array([0; 32]),
+    };
+    let wallet = Script::from(vec![0x51]);
+    let house = Script::from(vec![0x52]);
+    let attacker = Script::from(vec![0x53]);
+    let contract = PriceMarketContract::new_with_tick(PriceMarketParameters {
+        prediction_id: [7; 32],
+        feed_id: 0,
+        decimals: 8,
+        strike: 100,
+        above: true,
+        opens_at: 1000,
+        deadline: 1100,
+        claim_grace: 600,
+        verifier_asset_id: asset(0x33),
+        tick_asset_id: asset(0x22),
+        payout_script_hash: hash_script(&wallet),
+        house_script_hash: hash_script(&house),
+        network,
+    });
+    let tick = Voucher::new(VoucherParameters {
+        storm_eye_asset_id: asset(0x44),
+        auth_method: VoucherAuthMethod::Script {
+            auth_script_hash: hash_script(&attacker),
+        },
+        network,
+    });
+    let utxo = |asset, value, script_pubkey, vout| UTXO {
+        outpoint: OutPoint::new(Txid::from_byte_array([0; 32]), vout),
+        txout: TxOut {
+            asset: Asset::Explicit(asset),
+            value: Value::Explicit(value),
+            nonce: Nonce::Null,
+            script_pubkey,
+            witness: TxOutWitness::default(),
+        },
+        secrets: None,
+    };
+
+    let mut transaction = FinalTransaction::new();
+    for (vout, house_output_index) in house_outputs.into_iter().enumerate() {
+        contract.attach_spend(
+            &mut transaction,
+            &utxo(
+                asset(0x66),
+                50000,
+                contract.get_script_pubkey(),
+                vout as u32,
+            ),
+            PriceMarketSpend::Sweep {
+                tick_input_index: 2,
+                house_output_index,
+            },
+        );
+    }
+    tick.attach_spend(
+        &mut transaction,
+        &utxo(asset(0x22), 1701, tick.get_script_pubkey(), 2),
+        VoucherSpendPath::ScriptAuth {
+            auth_input_index: 3,
+            voucher_output_index: 2,
+        },
+    );
+    transaction.add_input(
+        PartialInput::new(utxo(asset(0x66), 2000, attacker.clone(), 3)),
+        RequiredSignature::None,
+    );
+    transaction.add_output(PartialOutput::new(house.clone(), 50000, asset(0x66)));
+    transaction.add_output(PartialOutput::new(
+        if second_to_house { house } else { attacker },
+        50000,
+        asset(0x66),
+    ));
+    transaction.add_output(PartialOutput::new(
+        Voucher::get_burn_script(2),
+        1701,
+        asset(0x22),
+    ));
+    let (pset, _) = transaction.extract_pst();
+    [0usize, 1].map(|index| {
+        let input = transaction.inputs()[index].program_input.as_ref().unwrap();
+        input
+            .program
+            .finalize(&pset, &input.witness, index, &network)
+            .is_ok()
+    })
+}
+
+#[test]
+fn each_position_must_pay_its_own_output() {
+    // Honest batch: position i pays house output i.
+    assert_eq!(sweep_two_positions([0, 1], true), [true, true]);
+    // XF-02: both positions name output 0, and the second 50,000 sats go elsewhere.
+    assert_eq!(sweep_two_positions([0, 0], false), [true, false]);
+    // A position may not point at another position's output either.
+    assert_eq!(sweep_two_positions([1, 0], true), [false, false]);
+}

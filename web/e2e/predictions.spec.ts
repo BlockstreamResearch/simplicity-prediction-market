@@ -24,6 +24,12 @@ import { ElementsRpcClient } from "@price-oracle/sdk";
 import { descriptorChecksum } from "../src/humid";
 
 const rpcUrl = process.env.TEST_ELEMENTS_RPC ?? "http://127.0.0.1:18884";
+
+function requiredEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`Set ${name} to the server's admin credentials`);
+  return value;
+}
 const rpcUser = process.env.TEST_RPC_USER ?? "high-storm";
 const rpcPassword = process.env.TEST_RPC_PASSWORD ?? "high-storm";
 const stateKey = "signal-market:user-state:v3";
@@ -312,6 +318,7 @@ test("claims and sweeps oracle price markets through Humid", async ({
           request?: {
             method: string;
             params: {
+              address?: string;
               assetId?: string;
               message?: string;
               pset?: string;
@@ -423,7 +430,7 @@ test("claims and sweeps oracle price markets through Humid", async ({
           .digest();
         const signed = ecc.signRecoverable(digest, key);
         return {
-          address,
+          address: request.params.address ?? address,
           protocol: "ecdsa",
           signatureEncoding: "hex-recoverable-ecdsa-65",
           signature: Buffer.concat([
@@ -529,10 +536,10 @@ test("claims and sweeps oracle price markets through Humid", async ({
   await page.getByRole("button", { name: "Demo", exact: true }).click();
   await page
     .getByLabel("Login", { exact: true })
-    .fill(process.env.TEST_ADMIN_LOGIN ?? "admin");
+    .fill(requiredEnv("TEST_ADMIN_LOGIN"));
   await page
     .getByLabel("Password", { exact: true })
-    .fill(process.env.TEST_ADMIN_PASSWORD ?? "prediction-demo");
+    .fill(requiredEnv("TEST_ADMIN_PASSWORD"));
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
   await expect(
     page.getByRole("heading", { name: "Market desk", exact: true }),

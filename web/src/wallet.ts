@@ -227,6 +227,22 @@ export async function hydrateFundingPset(
   }
 }
 
+/** The message each holder funding input key signs so the host reserves funds only for owned coins. */
+export function escrowOwnershipMessage(
+  predictionId: string,
+  stakeSats: number,
+  payoutScript: string,
+  inputs: Pick<OracleUtxo, "txid" | "vout">[],
+): string {
+  return [
+    "Prediction escrow funding",
+    `prediction: ${predictionId}`,
+    `stake_sats: ${stakeSats}`,
+    `payout: ${payoutScript.toLowerCase()}`,
+    `inputs: ${inputs.map((input) => `${input.txid.toLowerCase()}:${input.vout}`).join(",")}`,
+  ].join("\n");
+}
+
 export function verifyMatchedEscrow(
   original: Pset,
   funded: Pset,

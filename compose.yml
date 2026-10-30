@@ -23,6 +23,8 @@ services:
     restart: unless-stopped
     environment:
       RUST_LOG: ${RUST_LOG:-info,sqlx=warn}
+      PREDICTION_ADMIN_LOGIN: ${PREDICTION_ADMIN_LOGIN:?set PREDICTION_ADMIN_LOGIN for the Market desk admin}
+      PREDICTION_ADMIN_PASSWORD: ${PREDICTION_ADMIN_PASSWORD:?set PREDICTION_ADMIN_PASSWORD (at least 16 characters)}
     depends_on:
       postgres:
         condition: service_healthy

@@ -1,4 +1,4 @@
-use std::lib::asserts::{assert_eq_64, assert_eq_256};
+use std::lib::asserts::{assert_eq_32, assert_eq_64, assert_eq_256};
 
 pub fn get_explicit_input_amount(input_index: u32) -> (u256, u64) {
     let (asset, amount): (Asset1, Amount1) = unwrap(jet::input_amount(input_index));
@@ -8,7 +8,11 @@ pub fn get_explicit_input_amount(input_index: u32) -> (u256, u64) {
     (asset, amount)
 }
 
+// Each position input must pay its own output at the same index. Without this binding,
+// several equal-valued positions could all point at one payout/house output and the
+// spender could keep the rest (output aliasing).
 pub fn assert_payout_preserves_position(output_index: u32) {
+    assert_eq_32(output_index, jet::current_index());
     let (output_asset, output_amount): (Asset1, Amount1) = unwrap(jet::output_amount(output_index));
     let output_asset: u256 = unwrap_right::<Point>(output_asset);
     let output_amount: u64 = unwrap_right::<Point>(output_amount);

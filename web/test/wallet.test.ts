@@ -15,6 +15,7 @@ import {
 import {
   addWalletInputDerivation,
   createFundingPset,
+  escrowOwnershipMessage,
   getPayoutBlindingKey,
   EsploraClient,
   selectFundingUtxos,
@@ -239,6 +240,18 @@ const utxo = (
 });
 
 describe("prediction funding", () => {
+  test("escrow ownership message matches the server format", () => {
+    // Keep in sync with `ownership_message_format_is_stable` in server/src/escrow.rs.
+    expect(
+      escrowOwnershipMessage("ab".repeat(32), 100000, "0014" + "55".repeat(20).toUpperCase(), [
+        { txid: "11".repeat(32), vout: 0 },
+        { txid: "22".repeat(32), vout: 3 },
+      ]),
+    ).toBe(
+      `Prediction escrow funding\nprediction: ${"ab".repeat(32)}\nstake_sats: 100000\npayout: 0014${"55".repeat(20)}\ninputs: ${"11".repeat(32)}:0,${"22".repeat(32)}:3`,
+    );
+  });
+
   test("hydrates holder witness UTXOs and range proofs before mixed-wallet signing", async () => {
     const transaction = new Transaction();
     transaction.addInput(Buffer.alloc(32, 1), 0);

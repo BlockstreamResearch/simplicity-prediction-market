@@ -370,12 +370,17 @@ impl LocalWallet {
 
 #[derive(Clone, Deserialize)]
 pub struct EscrowConfig {
-    #[serde(default)]
-    pub wallet: String,
-    #[serde(default)]
-    pub private_key_file: Option<PathBuf>,
+    pub private_key_file: PathBuf,
+    #[serde(default = "default_min_stake_sats")]
+    pub min_stake_sats: u64,
     pub max_stake_sats: u64,
 }
+
+fn default_min_stake_sats() -> u64 {
+    10_000
+}
+
+const MAX_PENDING_PROPOSALS: usize = 64;
 
 #[derive(Serialize)]
 pub(super) struct ReserveStatus {
@@ -451,6 +456,10 @@ pub(super) struct PrepareRequest {
     pset: String,
     stake_sats: u64,
     contract: DeriveContractRequest,
+    /// One hex recoverable ECDSA message signature (compact || recovery id) per holder input,
+    /// over [`ownership_message`], made by that input's P2WPKH key.
+    #[serde(default)]
+    ownership_proofs: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -469,37 +478,6 @@ pub(super) struct CommitRequest {
 #[derive(Serialize)]
 pub(super) struct BroadcastResponse {
     txid: String,
-}
-
-async fn rpc(
-    state: &AppState,
-    method: &str,
-    params: serde_json::Value,
-) -> Result<serde_json::Value, ApiError> {
-    let config = state
-        .config
-        .escrow
-        .as_ref()
-        .ok_or_else(|| ApiError::conflict("host escrow reserves are not configured"))?;
-    let backend = &state.config.chain_backend;
-    let mut url = reqwest::Url::parse(&backend.rpc_url)
-        .map_err(|_| ApiError::internal("invalid host wallet RPC URL"))?;
-    url.path_segments_mut()
-        .map_err(|_| ApiError::internal("invalid host wallet RPC URL"))?
-        .pop_if_empty()
-        .push("wallet")
-        .push(&config.wallet);
-    let response: serde_json::Value = state.chain_client.post(url)
-        .basic_auth(&backend.rpc_username, Some(&backend.rpc_password))
-        .json(&serde_json::json!({ "jsonrpc": "1.0", "id": "prediction-escrow", "method": method, "params": params }))
-        .send().await.map_err(|_| ApiError::internal("host reserve wallet unavailable"))?
-        .json().await.map_err(|_| ApiError::internal("invalid host wallet response"))?;
-    if !response["error"].is_null() {
-        return Err(ApiError::conflict(
-            "host reserve wallet could not complete the escrow operation",
-        ));
-    }
-    Ok(response["result"].clone())
 }
 
 fn parse_pset(value: &str) -> Result<Pset, ApiError> {
@@ -638,15 +616,133 @@ fn validate_signed(expected: &Pset, signed: &Pset) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn reject_host_inputs(pset: &Pset, candidates: &[serde_json::Value]) -> Result<(), ApiError> {
-    if pset.inputs().iter().any(|input| {
-        candidates.iter().any(|candidate| {
-            candidate["txid"].as_str() == Some(&input.previous_txid.to_string())
-                && candidate["vout"].as_u64() == Some(u64::from(input.previous_output_index))
-        })
-    }) {
+fn spends(input: &Input, outpoint: &OutPoint) -> bool {
+    input.previous_txid == outpoint.txid && input.previous_output_index == outpoint.vout
+}
+
+fn reject_host_inputs(pset: &Pset, reserves: &[(OutPoint, TxOut)]) -> Result<(), ApiError> {
+    if pset
+        .inputs()
+        .iter()
+        .any(|input| reserves.iter().any(|(outpoint, _)| spends(input, outpoint)))
+    {
         return Err(ApiError::bad_request(
             "holder funding inputs must not belong to the host reserve wallet",
+        ));
+    }
+    Ok(())
+}
+
+/// Each holder outpoint may back at most one pending proposal, so one coin cannot hold
+/// several host reserves at once.
+fn reject_pending_holder_inputs(
+    proposals: &HashMap<String, Proposal>,
+    pset: &Pset,
+) -> Result<(), ApiError> {
+    if pset.inputs().iter().any(|input| {
+        proposals.values().any(|proposal| {
+            proposal.pset.inputs().iter().any(|pending| {
+                pending.previous_txid == input.previous_txid
+                    && pending.previous_output_index == input.previous_output_index
+            })
+        })
+    }) {
+        return Err(ApiError::conflict(
+            "holder funding inputs already back a pending opening; cancel it or wait up to 10 minutes",
+        ));
+    }
+    Ok(())
+}
+
+/// The message every holder input key signs to prove control before host funds are reserved.
+pub(super) fn ownership_message(id: &str, stake_sats: u64, payout: &Script, pset: &Pset) -> String {
+    let inputs = pset
+        .inputs()
+        .iter()
+        .map(|input| format!("{}:{}", input.previous_txid, input.previous_output_index))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "Prediction escrow funding\nprediction: {id}\nstake_sats: {stake_sats}\npayout: {}\ninputs: {inputs}",
+        hex::encode(payout.as_bytes())
+    )
+}
+
+fn verify_holder_ownership(pset: &Pset, message: &str, proofs: &[String]) -> Result<(), ApiError> {
+    use simplex::simplicityhl::elements::bitcoin::secp256k1::{
+        Secp256k1,
+        ecdsa::{RecoverableSignature, RecoveryId},
+    };
+    use simplex::simplicityhl::elements::bitcoin::sign_message::{
+        MessageSignature, signed_msg_hash,
+    };
+
+    if proofs.len() != pset.inputs().len() {
+        return Err(ApiError::bad_request(
+            "each holder funding input needs a signed ownership proof",
+        ));
+    }
+    let hash = signed_msg_hash(message);
+    let secp = Secp256k1::verification_only();
+    for (input, proof) in pset.inputs().iter().zip(proofs) {
+        let source = input
+            .witness_utxo
+            .as_ref()
+            .ok_or_else(|| ApiError::bad_request("holder funding prevout is missing"))?;
+        let invalid = || ApiError::bad_request("holder funding ownership proof is invalid");
+        let bytes = hex::decode(proof)
+            .ok()
+            .filter(|bytes| bytes.len() == 65)
+            .ok_or_else(invalid)?;
+        let recovery = RecoveryId::from_i32(i32::from(bytes[64])).map_err(|_| invalid())?;
+        let signature =
+            RecoverableSignature::from_compact(&bytes[..64], recovery).map_err(|_| invalid())?;
+        let key = MessageSignature::new(signature, true)
+            .recover_pubkey(&secp, hash)
+            .map_err(|_| invalid())?;
+        let key_hash = key.wpubkey_hash().map_err(|_| invalid())?;
+        if !source.script_pubkey.is_v0_p2wpkh()
+            || source.script_pubkey.as_bytes()[2..] != key_hash.as_byte_array()[..]
+        {
+            return Err(ApiError::bad_request(
+                "holder funding ownership proof does not match the input script",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Explicit holder inputs must cover every holder-funded output. Confidential amounts cannot be
+/// unblinded here; consensus still enforces their balance when the opening is broadcast.
+fn verify_holder_balance(pset: &Pset, policy: AssetId) -> Result<(), ApiError> {
+    let mut inputs = 0u64;
+    for input in pset.inputs() {
+        let source = input
+            .witness_utxo
+            .as_ref()
+            .ok_or_else(|| ApiError::bad_request("holder funding prevout is missing"))?;
+        match (source.asset.explicit(), source.value.explicit()) {
+            (Some(asset), Some(value)) if asset == policy => {
+                inputs = inputs
+                    .checked_add(value)
+                    .ok_or_else(|| ApiError::bad_request("holder funding overflows"))?;
+            }
+            (Some(_), Some(_)) => {
+                return Err(ApiError::bad_request("holder funding must spend LBTC"));
+            }
+            _ => return Ok(()),
+        }
+    }
+    let outputs = pset
+        .outputs()
+        .iter()
+        .try_fold(0u64, |sum, output| {
+            sum.checked_add(output.amount.unwrap_or(0))
+        })
+        .ok_or_else(|| ApiError::bad_request("escrow outputs overflow"))?;
+    if inputs < outputs {
+        return Err(ApiError::bad_request(
+            "holder funding inputs do not cover the stake, fees and change",
         ));
     }
     Ok(())
@@ -657,15 +753,19 @@ pub(super) async fn prepare(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<PrepareRequest>,
 ) -> Result<Json<FundingResponse>, ApiError> {
-    let config = state
-        .config
-        .escrow
-        .as_ref()
-        .ok_or_else(|| ApiError::conflict("host escrow reserves are not configured"))?;
-    if request.stake_sats == 0 || request.stake_sats > config.max_stake_sats {
-        return Err(ApiError::bad_request(
-            "stake exceeds the configured host matching limit",
+    let (Some(config), Some(wallet)) = (&state.config.escrow, &state.reserve_wallet) else {
+        return Err(ApiError::conflict(
+            "host escrow reserves are not configured",
         ));
+    };
+    if request.stake_sats < config.min_stake_sats.max(1)
+        || request.stake_sats > config.max_stake_sats
+    {
+        return Err(ApiError::bad_request(format!(
+            "stake must be between {} and {} sats to be matched by the host",
+            config.min_stake_sats.max(1),
+            config.max_stake_sats
+        )));
     }
     let escrow_sats = request
         .stake_sats
@@ -695,133 +795,65 @@ pub(super) async fn prepare(
         &contract,
         &payout,
     )?;
-    if state.reserve_wallet.is_none()
-        && (rpc(&state, "getblockchaininfo", serde_json::json!([])).await?["chain"]
-            != "elementsregtest"
-            || rpc(&state, "getblockhash", serde_json::json!([0]))
-                .await?
-                .as_str()
-                != Some(&state.config.genesis_block_hash))
+    verify_holder_ownership(
+        &pset,
+        &ownership_message(&id, request.stake_sats, &payout, &pset),
+        &request.ownership_proofs,
+    )?;
+    verify_holder_balance(&pset, state.network.policy_asset())?;
+
+    // Fail fast before any chain lookups; the proposal lock is never held across network calls.
     {
-        return Err(ApiError::conflict(
-            "automatic host matching is only supported on the configured Elements regtest chain",
-        ));
+        let mut proposals = state.escrows.lock().await;
+        proposals.retain(|_, proposal| proposal.expires_at > now);
+        if proposals.len() >= MAX_PENDING_PROPOSALS {
+            return Err(ApiError::conflict(
+                "host funding queue is full; try again later",
+            ));
+        }
+        reject_pending_holder_inputs(&proposals, &pset)?;
     }
+    let reserves = wallet.reserves(&state).await?;
+    wallet.verify_holder_inputs(&state, pset.inputs()).await?;
+    reject_host_inputs(&pset, &reserves)?;
+    let change = wallet.address.script_pubkey();
 
     let mut proposals = state.escrows.lock().await;
     proposals.retain(|_, proposal| proposal.expires_at > now);
-    if proposals.len() >= 64 {
+    if proposals.len() >= MAX_PENDING_PROPOSALS {
         return Err(ApiError::conflict(
             "host funding queue is full; try again later",
         ));
     }
-    let local_reserves = if let Some(wallet) = &state.reserve_wallet {
-        let reserves = wallet.reserves(&state).await?;
-        wallet.verify_holder_inputs(&state, pset.inputs()).await?;
-        Some(reserves)
-    } else {
-        None
-    };
-    let candidates = if let Some(reserves) = &local_reserves {
-        serde_json::Value::Array(reserves.iter().map(|(outpoint, output)| serde_json::json!({
-            "txid": outpoint.txid.to_string(), "vout": outpoint.vout,
-            "spendable": true, "confirmations": 1, "asset": output.asset.explicit().expect("checked reserve asset").to_string(),
-        })).collect())
-    } else {
-        rpc(&state, "listunspent", serde_json::json!([0, 9999999])).await?
-    };
-    let candidates = candidates
-        .as_array()
-        .ok_or_else(|| ApiError::internal("invalid host reserve balance"))?;
-    reject_host_inputs(&pset, candidates)?;
-    let mut reserve = None;
+    reject_pending_holder_inputs(&proposals, &pset)?;
     let mut pending_reserve = false;
-    for candidate in candidates.iter().filter(|candidate| {
-        candidate["spendable"] == true
-            && candidate["confirmations"].as_u64().unwrap_or(0) >= 1
-            && candidate["asset"].as_str() == Some(&state.config.policy_asset_id)
-    }) {
-        let txid: Txid = candidate["txid"]
-            .as_str()
-            .unwrap_or("")
-            .parse()
-            .map_err(|_| ApiError::internal("invalid host reserve outpoint"))?;
-        let vout: u32 = candidate["vout"]
-            .as_u64()
-            .and_then(|value| value.try_into().ok())
-            .ok_or_else(|| ApiError::internal("invalid host reserve outpoint"))?;
-        if pset
-            .inputs()
-            .iter()
-            .any(|input| input.previous_txid == txid && input.previous_output_index == vout)
-            || proposals.values().any(|proposal| {
-                proposal
-                    .pset
-                    .inputs()
-                    .iter()
-                    .any(|input| input.previous_txid == txid && input.previous_output_index == vout)
-            })
-        {
-            pending_reserve = true;
-            continue;
-        }
-        let output = if let Some(reserves) = &local_reserves {
-            reserves
-                .iter()
-                .find(|(outpoint, _)| outpoint.txid == txid && outpoint.vout == vout)
-                .map(|(_, output)| output.clone())
-                .ok_or_else(|| ApiError::internal("host reserve output disappeared"))?
-        } else {
-            let raw = rpc(
-                &state,
-                "getrawtransaction",
-                serde_json::json!([txid.to_string()]),
-            )
-            .await?;
-            let bytes = hex::decode(raw.as_str().unwrap_or(""))
-                .map_err(|_| ApiError::internal("invalid host reserve transaction"))?;
-            let transaction: Transaction =
-                simplex::simplicityhl::elements::encode::deserialize(&bytes)
-                    .map_err(|_| ApiError::internal("invalid host reserve transaction"))?;
-            transaction
-                .output
-                .get(vout as usize)
-                .cloned()
-                .ok_or_else(|| ApiError::internal("invalid host reserve output"))?
-        };
-        if output.asset.explicit() == Some(state.network.policy_asset())
-            && output
-                .value
-                .explicit()
-                .is_some_and(|amount| amount >= request.stake_sats)
-        {
-            reserve = Some((txid, vout, output.clone()));
-            break;
-        }
-    }
-    let (txid, vout, output) = reserve.ok_or_else(|| {
-        ApiError::conflict(if pending_reserve {
-            "host reserves are temporarily reserved by a pending opening; retry after it completes, is cancelled, or expires (up to 10 minutes)"
-        } else {
-            "host reserves need a confirmed explicit LBTC output large enough to match this stake"
+    // Take the smallest sufficient free reserve so small stakes do not lock large outputs.
+    let (outpoint, output) = reserves
+        .iter()
+        .filter(|(_, output)| {
+            output.asset.explicit() == Some(state.network.policy_asset())
+                && output
+                    .value
+                    .explicit()
+                    .is_some_and(|amount| amount >= request.stake_sats)
         })
-    })?;
-    let change = if let Some(wallet) = &state.reserve_wallet {
-        wallet.address.script_pubkey()
-    } else {
-        let change_address =
-            rpc(&state, "getrawchangeaddress", serde_json::json!(["bech32"])).await?;
-        let address_info = rpc(
-            &state,
-            "getaddressinfo",
-            serde_json::json!([change_address]),
-        )
-        .await?;
-        parse_script(
-            address_info["scriptPubKey"].as_str().unwrap_or(""),
-            "host change script",
-        )?
-    };
+        .filter(|(outpoint, _)| {
+            let pending = proposals
+                .values()
+                .any(|proposal| proposal.pset.inputs().iter().any(|input| spends(input, outpoint)));
+            pending_reserve |= pending;
+            !pending
+        })
+        .min_by_key(|(_, output)| output.value.explicit())
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::conflict(if pending_reserve {
+                "host reserves are temporarily reserved by a pending opening; retry after it completes, is cancelled, or expires (up to 10 minutes)"
+            } else {
+                "host reserves need a confirmed explicit LBTC output large enough to match this stake"
+            })
+        })?;
+    let (txid, vout) = (outpoint.txid, outpoint.vout);
     pset.outputs_mut()[0].amount = Some(escrow_sats);
     pset.add_input(Input {
         previous_txid: txid,
@@ -878,15 +910,20 @@ pub(super) async fn commit(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<CommitRequest>,
 ) -> Result<Json<BroadcastResponse>, ApiError> {
-    let mut proposals = state.escrows.lock().await;
-    let proposal = proposals.get(&request.funding_id).ok_or_else(|| {
-        ApiError::conflict("escrow funding proposal expired; prepare a new opening")
-    })?;
-    if proposal.prediction_id != id || proposal.expires_at <= unix_time()? {
-        return Err(ApiError::conflict(
-            "escrow funding proposal does not match this prediction or has expired",
-        ));
-    }
+    // Copy the proposal out so chain lookups below do not hold the shared proposal lock. It stays
+    // listed, keeping its reserve claimed, until the opening is broadcast.
+    let expected = {
+        let proposals = state.escrows.lock().await;
+        let proposal = proposals.get(&request.funding_id).ok_or_else(|| {
+            ApiError::conflict("escrow funding proposal expired; prepare a new opening")
+        })?;
+        if proposal.prediction_id != id || proposal.expires_at <= unix_time()? {
+            return Err(ApiError::conflict(
+                "escrow funding proposal does not match this prediction or has expired",
+            ));
+        }
+        proposal.pset.clone()
+    };
     let open = state
         .db
         .find(&id)
@@ -898,54 +935,37 @@ pub(super) async fn commit(
         ));
     }
     let mut signed = parse_pset(&request.pset)?;
-    validate_signed(&proposal.pset, &signed)?;
-    let transaction_hex = if let Some(wallet) = &state.reserve_wallet {
-        let input = signed.inputs().last().expect("prepared host input");
-        let outpoint = OutPoint::new(input.previous_txid, input.previous_output_index);
-        if !wallet
-            .reserves(&state)
-            .await?
-            .iter()
-            .any(|(candidate, output)| {
-                *candidate == outpoint && input.witness_utxo.as_ref() == Some(output)
-            })
-        {
-            return Err(ApiError::conflict(
-                "host reserve output is no longer confirmed and unspent",
-            ));
-        }
-        wallet
-            .verify_holder_inputs(&state, &signed.inputs()[..signed.inputs().len() - 1])
-            .await?;
-        let transaction = wallet.finalize(&mut signed)?;
-        validate_signed(&proposal.pset, &signed)?;
-        hex::encode(simplex::simplicityhl::elements::encode::serialize(
-            &transaction,
-        ))
-    } else {
-        let processed = rpc(
-            &state,
-            "walletprocesspsbt",
-            serde_json::json!([signed.to_string(), true, "ALL", true, false]),
-        )
+    validate_signed(&expected, &signed)?;
+    let wallet = state
+        .reserve_wallet
+        .as_ref()
+        .ok_or_else(|| ApiError::conflict("host escrow reserves are not configured"))?;
+    let input = signed.inputs().last().expect("prepared host input");
+    let outpoint = OutPoint::new(input.previous_txid, input.previous_output_index);
+    if !wallet
+        .reserves(&state)
+        .await?
+        .iter()
+        .any(|(candidate, output)| {
+            *candidate == outpoint && input.witness_utxo.as_ref() == Some(output)
+        })
+    {
+        return Err(ApiError::conflict(
+            "host reserve output is no longer confirmed and unspent",
+        ));
+    }
+    wallet
+        .verify_holder_inputs(&state, &signed.inputs()[..signed.inputs().len() - 1])
         .await?;
-        let processed_pset = parse_pset(processed["psbt"].as_str().unwrap_or(""))?;
-        validate_signed(&proposal.pset, &processed_pset)?;
-        let finalized = rpc(
-            &state,
-            "finalizepsbt",
-            serde_json::json!([processed_pset.to_string()]),
-        )
-        .await?;
-        if finalized["complete"] != true {
-            return Err(ApiError::bad_request(
-                "Humid must sign all holder funding inputs before the host can open escrow",
-            ));
-        }
-        finalized["hex"].as_str().unwrap_or("").to_owned()
-    };
+    // The local key signs only the last (host reserve) input; holder inputs must carry their own
+    // signatures and may never pay to the reserve script.
+    let transaction = wallet.finalize(&mut signed)?;
+    validate_signed(&expected, &signed)?;
+    let transaction_hex = hex::encode(simplex::simplicityhl::elements::encode::serialize(
+        &transaction,
+    ));
     let txid = broadcast_transaction(State(state.clone()), transaction_hex).await?;
-    proposals.remove(&request.funding_id);
+    state.escrows.lock().await.remove(&request.funding_id);
     Ok(Json(BroadcastResponse { txid }))
 }
 
@@ -1175,8 +1195,8 @@ mod tests {
         config.oracle_url = config.chain_backend.esplora_url.clone();
         config.chain_backend.rpc_url.clear();
         config.escrow = Some(EscrowConfig {
-            wallet: String::new(),
-            private_key_file: Some(key_path),
+            private_key_file: key_path,
+            min_stake_sats: 10_000,
             max_stake_sats: 1_000_000,
         });
         let task = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
@@ -1258,7 +1278,11 @@ mod tests {
                 .body(Body::from(body.to_string()))
                 .unwrap()
         };
-        let body = serde_json::json!({ "stake_sats": 100_000, "pset": pset.to_string(), "contract": parameters });
+        let proof = ownership_proof(
+            &holder.secret_key,
+            &ownership_message(&id, 100_000, &holder.address.script_pubkey(), &pset),
+        );
+        let body = serde_json::json!({ "stake_sats": 100_000, "pset": pset.to_string(), "contract": parameters, "ownership_proofs": [proof] });
         let response = router
             .clone()
             .oneshot(request(
@@ -1316,7 +1340,7 @@ mod tests {
             conflict["error"]
                 .as_str()
                 .unwrap()
-                .contains("temporarily reserved")
+                .contains("already back a pending opening")
         );
         let cancel_request = |market_id: &str| {
             Request::builder()
@@ -1452,6 +1476,22 @@ mod tests {
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
+    fn ownership_proof(key: &ZkpSecretKey, message: &str) -> String {
+        use simplex::simplicityhl::elements::bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+        use simplex::simplicityhl::elements::bitcoin::sign_message::signed_msg_hash;
+
+        let secret = SecretKey::from_slice(&key.secret_bytes()).unwrap();
+        let (recovery, compact) = Secp256k1::new()
+            .sign_ecdsa_recoverable(
+                &Message::from_digest(signed_msg_hash(message).to_byte_array()),
+                &secret,
+            )
+            .serialize_compact();
+        let mut bytes = compact.to_vec();
+        bytes.push(recovery.to_i32() as u8);
+        hex::encode(bytes)
+    }
+
     fn funding() -> (Pset, Script, Script, AssetId) {
         let policy = parse_asset(&"66".repeat(32), "policy").unwrap();
         let payout = parse_script(&format!("0014{}", "55".repeat(20)), "payout").unwrap();
@@ -1475,10 +1515,33 @@ mod tests {
     }
 
     #[test]
+    fn ownership_message_format_is_stable() {
+        // Keep in sync with `escrowOwnershipMessage` in web/src/wallet.ts.
+        let (mut pset, _, payout, _) = funding();
+        let mut second = pset.inputs()[0].clone();
+        second.previous_txid = "22".repeat(32).parse().unwrap();
+        second.previous_output_index = 3;
+        pset.add_input(second);
+        assert_eq!(
+            ownership_message(&"ab".repeat(32), 100_000, &payout, &pset),
+            format!(
+                "Prediction escrow funding\nprediction: {}\nstake_sats: 100000\npayout: 0014{}\ninputs: {}:0,{}:3",
+                "ab".repeat(32),
+                "55".repeat(20),
+                "11".repeat(32),
+                "22".repeat(32)
+            )
+        );
+    }
+
+    #[test]
     fn funding_requires_stake_fees_and_holder_change() {
         let (pset, contract, payout, policy) = funding();
         assert!(validate_funding(&pset, 100_000, policy, &contract, &payout).is_ok());
-        let owned = serde_json::json!({ "txid": "11".repeat(32), "vout": 0 });
+        let owned = (
+            OutPoint::new("11".repeat(32).parse().unwrap(), 0),
+            TxOut::default(),
+        );
         assert!(reject_host_inputs(&pset, &[owned]).is_err());
         assert!(reject_host_inputs(&pset, &[]).is_ok());
         for index in 0..4 {
@@ -1530,51 +1593,93 @@ mod tests {
 
     #[tokio::test]
     async fn escrow_routes_match_once_and_reject_tampering_and_unsigned_openings() {
-        let policy = parse_asset(&"66".repeat(32), "policy").unwrap();
-        let wallet_script = parse_script(&format!("0014{}", "55".repeat(20)), "wallet").unwrap();
-        let reserve_tx = Transaction {
+        let network = SimplicityNetwork::LiquidTestnet;
+        let policy = network.policy_asset();
+        let directory = std::env::temp_dir().join(format!("escrow-routes-{}", Uuid::new_v4()));
+        let key_path = directory.join("reserve.key");
+        let wallet = LocalWallet::load(&key_path, network).await.unwrap();
+        let wallet_script = parse_script(&format!("0014{}", "55".repeat(20)), "payout").unwrap();
+        let explicit = |amount: u64, script_pubkey: Script| TxOut {
+            asset: Asset::Explicit(policy),
+            value: Value::Explicit(amount),
+            nonce: Nonce::Null,
+            script_pubkey,
+            witness: TxOutWitness::default(),
+        };
+        let transaction = |seed: u8, outputs: Vec<TxOut>| Transaction {
             version: 2,
             lock_time: simplex::simplicityhl::elements::LockTime::ZERO,
-            input: vec![],
-            output: vec![TxOut {
-                asset: Asset::Explicit(policy),
-                value: Value::Explicit(1_000_000),
-                nonce: Nonce::Null,
-                script_pubkey: wallet_script.clone(),
-                witness: TxOutWitness::default(),
+            input: vec![simplex::simplicityhl::elements::TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([seed; 32]), 0),
+                ..Default::default()
             }],
+            output: outputs,
         };
-        let reserve_hex = hex::encode(simplex::simplicityhl::elements::encode::serialize(
+        let holder = LocalWallet::new(ZkpSecretKey::from_slice(&[2; 32]).unwrap(), network);
+        let other = LocalWallet::new(ZkpSecretKey::from_slice(&[3; 32]).unwrap(), network);
+        let third = LocalWallet::new(ZkpSecretKey::from_slice(&[4; 32]).unwrap(), network);
+        let reserve_tx = transaction(
+            1,
+            [1_000_000, 150_000]
+                .map(|amount| explicit(amount, wallet.script_pubkey()))
+                .to_vec(),
+        );
+        let holder_tx = transaction(2, vec![explicit(113_000, holder.script_pubkey())]);
+        let other_tx = transaction(3, vec![explicit(113_000, other.script_pubkey())]);
+        let third_tx = transaction(4, vec![explicit(113_000, third.script_pubkey())]);
+        // An output that pays the host reserve script but is not one of its confirmed reserves,
+        // such as the host change of another opening.
+        let host_change_tx = transaction(5, vec![explicit(113_000, wallet.script_pubkey())]);
+        let mut chain = HashMap::new();
+        for tx in [
             &reserve_tx,
-        ));
-        let backend = Router::new().merge(super::super::tests::oracle_routes("elementsregtest")).route("/wallet/host", post(move |Json(request): Json<serde_json::Value>| {
-            let reserve_hex = reserve_hex.clone();
-            async move {
-                let result = match request["method"].as_str().unwrap() {
-                    "getblockchaininfo" => serde_json::json!({ "chain": "elementsregtest" }),
-                    "getblockhash" => serde_json::json!("cd179c84c35f51825f20a3b91a18d45f0c53b5ceb744a5b6ef8f0babe809396f"),
-                    "listunspent" => serde_json::json!([{ "txid": "22".repeat(32), "vout": 0, "spendable": true, "confirmations": 1, "asset": "66".repeat(32) }]),
-                    "getrawtransaction" => serde_json::json!(reserve_hex),
-                    "getrawchangeaddress" => serde_json::json!("host-address"),
-                    "getaddressinfo" => serde_json::json!({ "scriptPubKey": format!("0014{}", "88".repeat(20)) }),
-                    "walletprocesspsbt" => {
-                        assert_eq!(request["params"][2], "ALL");
-                        assert_eq!(request["params"][4], false);
-                        serde_json::json!({ "psbt": request["params"][0], "complete": false })
-                    },
-                    "finalizepsbt" => serde_json::json!({ "complete": false }),
-                    method => panic!("unexpected wallet RPC: {method}"),
-                };
-                Json(serde_json::json!({ "result": result, "error": null }))
-            }
-        }));
+            &holder_tx,
+            &other_tx,
+            &third_tx,
+            &host_change_tx,
+        ] {
+            chain.insert(
+                tx.txid().to_string(),
+                hex::encode(simplex::simplicityhl::elements::encode::serialize(tx)),
+            );
+        }
+        let candidates = serde_json::json!([0, 1].map(|vout| serde_json::json!({
+            "txid": reserve_tx.txid().to_string(), "vout": vout, "status": { "confirmed": true },
+        })));
+        let backend = Router::new()
+            .merge(super::super::tests::oracle_routes("liquidtestnet"))
+            .route(
+                "/block-height/0",
+                get(move || async move { network.genesis_block_hash().to_string() }),
+            )
+            .route(
+                "/address/{address}/utxo",
+                get(move || {
+                    let candidates = candidates.clone();
+                    async move { Json(candidates) }
+                }),
+            )
+            .route(
+                "/tx/{txid}/hex",
+                get(move |AxumPath(txid): AxumPath<String>| {
+                    let raw = chain.get(&txid).cloned();
+                    async move { raw.ok_or(StatusCode::NOT_FOUND) }
+                }),
+            )
+            .route(
+                "/tx/{txid}/outspend/{vout}",
+                get(|| async { Json(serde_json::json!({ "spent": false })) }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut config = super::super::tests::config();
-        config.chain_backend.rpc_url = format!("http://{}", listener.local_addr().unwrap());
-        config.oracle_url = config.chain_backend.rpc_url.clone();
+        config.policy_asset_id = policy.to_string();
+        config.genesis_block_hash = network.genesis_block_hash().to_string();
+        config.chain_backend.esplora_url = format!("http://{}", listener.local_addr().unwrap());
+        config.oracle_url = config.chain_backend.esplora_url.clone();
+        config.chain_backend.rpc_url.clear();
         config.escrow = Some(EscrowConfig {
-            wallet: "host".into(),
-            private_key_file: None,
+            private_key_file: key_path,
+            min_stake_sats: 10_000,
             max_stake_sats: 1_000_000,
         });
         let task = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
@@ -1600,10 +1705,29 @@ mod tests {
         .await
         .unwrap()
         .0;
-        let (mut pset, _, _, _) = funding();
-        pset.outputs_mut()[0].script_pubkey =
-            parse_script(&derived.script_pubkey, "contract").unwrap();
-        let prepare_body = serde_json::json!({ "pset": pset.to_string(), "stake_sats": 100_000, "contract": parameters });
+        let contract = parse_script(&derived.script_pubkey, "contract").unwrap();
+        let holder_pset = |source: &Transaction, value: u64| {
+            let (mut pset, _, _, _) = funding();
+            pset.outputs_mut()[0].script_pubkey = contract.clone();
+            for output in pset.outputs_mut() {
+                output.asset = Some(policy);
+            }
+            pset.inputs_mut()[0].previous_txid = source.txid();
+            pset.inputs_mut()[0].witness_utxo =
+                Some(explicit(value, source.output[0].script_pubkey.clone()));
+            pset
+        };
+        let body_for = |pset: &Pset, stake: u64, proofs: Vec<String>| serde_json::json!({ "pset": pset.to_string(), "stake_sats": stake, "contract": parameters, "ownership_proofs": proofs });
+        let signed_body = |holder: &LocalWallet, pset: &Pset| {
+            let message = ownership_message(&id, 100_000, &wallet_script, pset);
+            body_for(
+                pset,
+                100_000,
+                vec![ownership_proof(&holder.secret_key, &message)],
+            )
+        };
+        let pset = holder_pset(&holder_tx, 113_000);
+        let prepare_body = signed_body(&holder, &pset);
         let request = |path: &str, body: serde_json::Value| {
             Request::builder()
                 .method("POST")
@@ -1627,9 +1751,12 @@ mod tests {
         let matched = parse_pset(body["pset"].as_str().unwrap()).unwrap();
         assert_eq!(body["escrow_sats"], 200_000);
         assert_eq!(matched.outputs()[0].amount, Some(200_000));
-        assert_eq!(matched.outputs().last().unwrap().amount, Some(900_000));
+        // The smallest sufficient reserve (150,000 sats) is matched, not the first one.
+        assert_eq!(matched.outputs().last().unwrap().amount, Some(50_000));
         assert_eq!(matched.inputs().len(), 2);
+        assert_eq!(matched.inputs()[1].previous_output_index, 1);
 
+        // The same holder outpoint cannot back a second pending opening.
         let response = app
             .router()
             .oneshot(request(
@@ -1639,6 +1766,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(
+            error["error"]
+                .as_str()
+                .unwrap()
+                .contains("already back a pending opening")
+        );
+        assert_eq!(app.state.escrows.lock().await.len(), 1);
+
+        // Reserving host funds requires a proof of control over every holder input, an explicit
+        // value balance, and a stake above the minimum.
+        let pset = holder_pset(&other_tx, 113_000);
+        let message = ownership_message(&id, 100_000, &wallet_script, &pset);
+        let wrong_stake = ownership_message(&id, 200_000, &wallet_script, &pset);
+        let unfunded = holder_pset(&other_tx, 1_000);
+        let unfunded_message = ownership_message(&id, 100_000, &wallet_script, &unfunded);
+        let (mut tiny, _, _, _) = funding();
+        tiny.outputs_mut()[0].script_pubkey = contract.clone();
+        tiny.outputs_mut()[0].amount = Some(1);
+        tiny.inputs_mut()[0] = pset.inputs()[0].clone();
+        let tiny_message = ownership_message(&id, 1, &wallet_script, &tiny);
+        for body in [
+            body_for(&pset, 100_000, vec![]),
+            body_for(&pset, 100_000, vec!["00".repeat(65)]),
+            body_for(
+                &pset,
+                100_000,
+                vec![ownership_proof(&holder.secret_key, &message)],
+            ),
+            body_for(
+                &pset,
+                100_000,
+                vec![ownership_proof(&other.secret_key, &wrong_stake)],
+            ),
+            body_for(
+                &unfunded,
+                100_000,
+                vec![ownership_proof(&other.secret_key, &unfunded_message)],
+            ),
+            body_for(
+                &tiny,
+                1,
+                vec![ownership_proof(&other.secret_key, &tiny_message)],
+            ),
+        ] {
+            let response = app
+                .router()
+                .oneshot(request(&format!("/api/predictions/{id}/escrow"), body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(app.state.escrows.lock().await.len(), 1);
+
+        // Holder inputs must already exist on chain and must never pay the host reserve script,
+        // even when the request carries a valid proof for that key.
+        let mut unconfirmed = holder_pset(&third_tx, 113_000);
+        unconfirmed.inputs_mut()[0].previous_txid = Txid::from_byte_array([9; 32]);
+        for (key, pset) in [
+            (&third, unconfirmed),
+            (&wallet, holder_pset(&host_change_tx, 113_000)),
+        ] {
+            let response = app
+                .router()
+                .oneshot(request(
+                    &format!("/api/predictions/{id}/escrow"),
+                    signed_body(key, &pset),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        // A second owned input takes the remaining reserve; a third finds every reserve pending.
+        let response = app
+            .router()
+            .oneshot(request(
+                &format!("/api/predictions/{id}/escrow"),
+                signed_body(&other, &pset),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .router()
+            .oneshot(request(
+                &format!("/api/predictions/{id}/escrow"),
+                signed_body(&third, &holder_pset(&third_tx, 113_000)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(
+            error["error"]
+                .as_str()
+                .unwrap()
+                .contains("temporarily reserved")
+        );
+        assert_eq!(app.state.escrows.lock().await.len(), 2);
         let mut tampered = matched.clone();
         tampered.outputs_mut()[0].amount = Some(100_000);
         for (pset, expected) in [
@@ -1652,172 +1883,6 @@ mod tests {
         let response = app.router().oneshot(request(&format!("/api/predictions/{id}/escrow/commit"), serde_json::json!({ "funding_id": body["funding_id"], "pset": matched.to_string() }))).await.unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
         task.abort();
-    }
-
-    #[tokio::test]
-    #[ignore = "requires funded local Elements regtest host and bootstrap wallets; locks a 1000-sat host match"]
-    async fn live_regtest_co_signing_opens_a_doubled_escrow() {
-        let mut config = Config::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml"))
-            .await
-            .unwrap();
-        config.database_url = "sqlite::memory:".into();
-        config.database_max_connections = 1;
-        let app = App::new(config).await.unwrap();
-        assert_eq!(
-            rpc(&app.state, "getblockchaininfo", serde_json::json!([]))
-                .await
-                .unwrap()["chain"],
-            "elementsregtest"
-        );
-        let mut holder = app.state.clone();
-        holder.config.escrow.as_mut().unwrap().wallet = "bootstrap".into();
-        let outputs = rpc(&holder, "listunspent", serde_json::json!([1, 9999999]))
-            .await
-            .unwrap();
-        let mut source = None;
-        for candidate in outputs
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|output| output["spendable"] == true)
-        {
-            let txid: Txid = candidate["txid"].as_str().unwrap().parse().unwrap();
-            let vout = candidate["vout"].as_u64().unwrap() as u32;
-            let raw = rpc(
-                &holder,
-                "getrawtransaction",
-                serde_json::json!([txid.to_string()]),
-            )
-            .await
-            .unwrap();
-            let transaction: Transaction = simplex::simplicityhl::elements::encode::deserialize(
-                &hex::decode(raw.as_str().unwrap()).unwrap(),
-            )
-            .unwrap();
-            let output = transaction.output[vout as usize].clone();
-            if output.asset.explicit() == Some(app.state.network.policy_asset())
-                && output.value.explicit().is_some_and(|value| value > 15_000)
-            {
-                source = Some((txid, vout, output));
-                break;
-            }
-        }
-        let (txid, vout, source) =
-            source.expect("bootstrap needs a confirmed explicit policy-asset output");
-        let address = rpc(
-            &holder,
-            "getnewaddress",
-            serde_json::json!(["escrow-verification", "bech32"]),
-        )
-        .await
-        .unwrap();
-        let info = rpc(&holder, "getaddressinfo", serde_json::json!([address]))
-            .await
-            .unwrap();
-        let payout = parse_script(info["scriptPubKey"].as_str().unwrap(), "holder").unwrap();
-        let id = hex::encode(Sha256::digest(Uuid::new_v4().as_bytes()));
-        let account = price::account(&app.state, crate::tests::HOLDER_PUBLIC_KEY)
-            .await
-            .unwrap();
-        let mut terms = super::super::tests::price_terms();
-        terms.tick_asset_id = account.tick_asset_id;
-        terms.verifier_asset_id = account.oracle_verifier_asset_id;
-        terms.storm_eye_asset_id = account.storm_eye_asset_id;
-        app.state
-            .db
-            .insert(&Prediction {
-                id: id.clone(),
-                title: "Live escrow verification".into(),
-                created_at: unix_time().unwrap(),
-                deadline: unix_time().unwrap() + 3600,
-                price: terms,
-            })
-            .await
-            .unwrap();
-        let parameters = || DeriveContractRequest {
-            payout_script_pubkey: hex::encode(payout.as_bytes()),
-            owner_public_key: Some(crate::tests::HOLDER_PUBLIC_KEY.into()),
-        };
-        let derived = derive_contract(
-            State(app.state.clone()),
-            AxumPath(id.clone()),
-            Json(parameters()),
-        )
-        .await
-        .unwrap()
-        .0;
-        let mut pset = Pset::new_v2();
-        pset.add_input(Input {
-            previous_txid: txid,
-            previous_output_index: vout,
-            witness_utxo: Some(source.clone()),
-            sighash_type: Some(EcdsaSighashType::All.into()),
-            ..Input::default()
-        });
-        let policy = app.state.network.policy_asset();
-        for (script, amount) in [
-            (
-                parse_script(&derived.script_pubkey, "position").unwrap(),
-                1000,
-            ),
-            (payout.clone(), 10_000),
-            (payout.clone(), source.value.explicit().unwrap() - 12_000),
-            (Script::new(), 1000),
-        ] {
-            pset.add_output(Output::new_explicit(script, amount, policy, None));
-        }
-        let funding = prepare(
-            State(app.state.clone()),
-            AxumPath(id.clone()),
-            Json(PrepareRequest {
-                pset: pset.to_string(),
-                stake_sats: 1000,
-                contract: parameters(),
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        let expected_host_change = parse_pset(&funding.pset)
-            .unwrap()
-            .outputs()
-            .last()
-            .unwrap()
-            .amount;
-        let signed = rpc(
-            &holder,
-            "walletprocesspsbt",
-            serde_json::json!([funding.pset, true, "ALL", true, false]),
-        )
-        .await
-        .unwrap();
-        let result = commit(
-            State(app.state.clone()),
-            AxumPath(id),
-            Json(CommitRequest {
-                funding_id: funding.funding_id,
-                pset: signed["psbt"].as_str().unwrap().to_owned(),
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        let raw = rpc(
-            &app.state,
-            "getrawtransaction",
-            serde_json::json!([result.txid]),
-        )
-        .await
-        .unwrap();
-        let transaction: Transaction = simplex::simplicityhl::elements::encode::deserialize(
-            &hex::decode(raw.as_str().unwrap()).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(transaction.input.len(), 2);
-        assert_eq!(transaction.output[0].value.explicit(), Some(2000));
-        assert_eq!(
-            transaction.output.last().unwrap().value.explicit(),
-            expected_host_change
-        );
+        tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 }

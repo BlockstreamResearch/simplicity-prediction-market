@@ -47,7 +47,11 @@ pub struct Config {
     pub database_url: String,
     #[serde(default = "default_database_max_connections")]
     pub database_max_connections: u32,
+    /// Read from [`ADMIN_LOGIN_ENV`] at startup, never from the config file.
+    #[serde(skip)]
     pub admin_login: String,
+    /// Read from [`ADMIN_PASSWORD_ENV`] at startup, never from the config file.
+    #[serde(skip)]
     pub admin_password: String,
     pub policy_asset_id: String,
     pub genesis_block_hash: String,
@@ -95,10 +99,38 @@ fn default_database_max_connections() -> u32 {
     5
 }
 
+pub const ADMIN_LOGIN_ENV: &str = "PREDICTION_ADMIN_LOGIN";
+pub const ADMIN_PASSWORD_ENV: &str = "PREDICTION_ADMIN_PASSWORD";
+const MIN_ADMIN_PASSWORD_CHARS: usize = 16;
+/// Passwords shipped in earlier example configs; never accepted.
+const KNOWN_ADMIN_PASSWORDS: [&str; 4] = ["prediction-demo", "change-me", "admin", "password"];
+
 impl Config {
+    /// Loads the config file and takes the admin credentials from the environment, so they are
+    /// supplied when the service starts instead of being stored with the deployment.
     pub async fn load(path: &Path) -> Result<Self, AppError> {
         let contents = tokio::fs::read_to_string(path).await?;
-        Ok(toml::from_str(&contents)?)
+        let table: toml::Table = toml::from_str(&contents)?;
+        if table.contains_key("admin_login") || table.contains_key("admin_password") {
+            return Err(AppError::AdminCredentialsInConfig);
+        }
+        let mut config: Self = toml::from_str(&contents)?;
+        config.admin_login = std::env::var(ADMIN_LOGIN_ENV).unwrap_or_default();
+        config.admin_password = std::env::var(ADMIN_PASSWORD_ENV).unwrap_or_default();
+        Ok(config)
+    }
+
+    fn validate_admin_credentials(&self) -> Result<(), AppError> {
+        let login = self.admin_login.trim();
+        let password = &self.admin_password;
+        if login.is_empty()
+            || password.chars().count() < MIN_ADMIN_PASSWORD_CHARS
+            || password == login
+            || KNOWN_ADMIN_PASSWORDS.contains(&password.as_str())
+        {
+            return Err(AppError::WeakAdminCredentials);
+        }
+        Ok(())
     }
 }
 
@@ -117,6 +149,7 @@ struct AppState {
     network: SimplicityNetwork,
     db: db::Database,
     sessions: Arc<RwLock<HashMap<String, u64>>>,
+    login_throttle: Arc<tokio::sync::Mutex<LoginThrottle>>,
     chain_client: reqwest::Client,
     escrows: escrow::Proposals,
     reserve_wallet: Option<escrow::LocalWallet>,
@@ -141,6 +174,7 @@ pub struct App {
 
 impl App {
     pub async fn new(config: Config) -> Result<Self, AppError> {
+        config.validate_admin_credentials()?;
         if config.trust_coordinator && config.oracle_verification.is_some() {
             return Err(AppError::ConflictingOracleTrust);
         }
@@ -158,14 +192,7 @@ impl App {
             genesis_hash,
         };
         let reserve_wallet = if let Some(escrow) = &config.escrow {
-            if let Some(path) = &escrow.private_key_file {
-                if !escrow.wallet.is_empty() {
-                    return Err(AppError::InvalidEscrowKey);
-                }
-                Some(escrow::LocalWallet::load(path, network).await?)
-            } else {
-                None
-            }
+            Some(escrow::LocalWallet::load(&escrow.private_key_file, network).await?)
         } else {
             None
         };
@@ -184,6 +211,7 @@ impl App {
                     .build()?,
                 db,
                 sessions: Arc::default(),
+                login_throttle: Arc::default(),
             },
         })
     }
@@ -240,8 +268,7 @@ struct PublicConfig {
 
 async fn public_config(State(state): State<AppState>) -> Json<PublicConfig> {
     let network = state.oracle_network();
-    let matched_escrow_enabled = state.config.escrow.is_some()
-        && (state.reserve_wallet.is_some() || network == "elementsregtest");
+    let matched_escrow_enabled = state.reserve_wallet.is_some();
 
     Json(PublicConfig {
         policy_asset_id: state.config.policy_asset_id,
@@ -257,26 +284,54 @@ async fn read_chain(
     AxumPath(path): AxumPath<String>,
     OriginalUri(uri): OriginalUri,
 ) -> Result<(StatusCode, axum::body::Bytes), ApiError> {
-    if path.split('/').any(|part| part == "." || part == "..") || path.contains(['\\', '?', '#']) {
+    // Esplora paths only use these characters. Rejecting everything else (notably `.` and `%`)
+    // keeps encoded dot segments such as `%2e%2e` from escaping the configured base path.
+    if path.split('/').any(|segment| {
+        segment.is_empty()
+            || !segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    }) {
         return Err(ApiError::bad_request("invalid chain lookup path"));
     }
     let mut url = reqwest::Url::parse(&state.config.chain_backend.esplora_url)
         .map_err(|_| ApiError::internal("invalid chain index configuration"))?;
-    url.set_path(&format!("{}/{}", url.path().trim_end_matches('/'), path));
+    let base = format!("{}/", url.path().trim_end_matches('/'));
+    url.set_path(&format!("{base}{path}"));
+    if !url.path().starts_with(&base) {
+        return Err(ApiError::bad_request("invalid chain lookup path"));
+    }
     url.set_query(uri.query());
-    let response = state
+    let mut response = state
         .chain_client
         .get(url)
         .send()
         .await
         .map_err(|_| ApiError::internal("chain index unavailable"))?;
     let status = response.status();
-    let body = response
-        .bytes()
+    let too_large = || ApiError::internal("chain index response is too large");
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_CHAIN_RESPONSE_BYTES as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|_| ApiError::internal("chain index response failed"))?;
-    Ok((status, body))
+        .map_err(|_| ApiError::internal("chain index response failed"))?
+    {
+        if body.len() + chunk.len() > MAX_CHAIN_RESPONSE_BYTES {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((status, body.into()))
 }
+
+/// Upper bound on a proxied chain index response, so one lookup cannot buffer unbounded data.
+const MAX_CHAIN_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 fn tick_burn_allowance(outputs: &[TxOut], policy_asset: AssetId) -> Result<u64, ApiError> {
     let mut allowance = 0u64;
@@ -549,17 +604,51 @@ struct LoginResponse {
     expires_at: u64,
 }
 
+/// Failed logins allowed before back-off starts.
+const FREE_LOGIN_FAILURES: u32 = 5;
+const MAX_LOGIN_BACKOFF_SECONDS: u64 = 300;
+
+/// Server-wide failed-login back-off. It is global rather than per client because the API usually
+/// sits behind a proxy that hides client addresses.
+#[derive(Default)]
+struct LoginThrottle {
+    failures: u32,
+    locked_until: u64,
+}
+
 async fn login(
     State(state): State<AppState>,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, ApiError> {
-    if !constant_time_equal(&request.login, &state.config.admin_login)
-        || !constant_time_equal(&request.password, &state.config.admin_password)
-    {
+    let now = unix_time()?;
+    let mut throttle = state.login_throttle.lock().await;
+    if now < throttle.locked_until {
+        return Err(ApiError::too_many_requests(format!(
+            "too many failed admin logins; retry in {} seconds",
+            throttle.locked_until - now
+        )));
+    }
+    let login_matches = constant_time_equal(&request.login, &state.config.admin_login);
+    let password_matches = constant_time_equal(&request.password, &state.config.admin_password);
+    if !(login_matches & password_matches) {
+        throttle.failures = throttle.failures.saturating_add(1);
+        let backoff = throttle
+            .failures
+            .checked_sub(FREE_LOGIN_FAILURES)
+            .map_or(0, |excess| {
+                (1u64 << excess.min(16)).min(MAX_LOGIN_BACKOFF_SECONDS)
+            });
+        throttle.locked_until = now.saturating_add(backoff);
+        tracing::warn!(
+            failures = throttle.failures,
+            backoff_seconds = backoff,
+            "failed admin login"
+        );
         return Err(ApiError::unauthorized("invalid login or password"));
     }
+    *throttle = LoginThrottle::default();
+    drop(throttle);
 
-    let now = unix_time()?;
     let expires_at = now.saturating_add(state.config.session_lifetime_seconds);
     let token = random_token();
     state
@@ -597,7 +686,7 @@ async fn create_prediction(
     let price = request
         .price
         .ok_or_else(|| ApiError::bad_request("predictions require oracle price terms"))?;
-    let price = price::publish(&state, price, request.deadline).await?;
+    let price = price::publish(&state, price, request.deadline, now).await?;
 
     let id = prediction_id(title, request.deadline, Uuid::new_v4());
     let prediction = Prediction {
@@ -678,9 +767,7 @@ pub enum AppError {
     Migration(#[from] sqlx::migrate::MigrateError),
     #[error(transparent)]
     Secp256k1(#[from] secp256k1::Error),
-    #[error(
-        "escrow private key file must contain a valid 32-byte secret key; choose either a local key file or a node wallet"
-    )]
+    #[error("escrow private_key_file must contain a valid 32-byte secret key")]
     InvalidEscrowKey,
     #[error("policy_asset_id must be a valid Elements asset ID")]
     InvalidPolicyAsset,
@@ -688,6 +775,14 @@ pub enum AppError {
     InvalidGenesisHash,
     #[error("choose either trust_coordinator = true or pinned [oracle_verification], not both")]
     ConflictingOracleTrust,
+    #[error(
+        "remove admin_login and admin_password from the config file; pass them in the PREDICTION_ADMIN_LOGIN and PREDICTION_ADMIN_PASSWORD environment variables when starting the server"
+    )]
+    AdminCredentialsInConfig,
+    #[error(
+        "set PREDICTION_ADMIN_LOGIN and PREDICTION_ADMIN_PASSWORD when starting the server; the password needs at least 16 characters and must not be a shipped example or equal the login"
+    )]
+    WeakAdminCredentials,
 }
 
 #[derive(Debug)]
@@ -700,6 +795,13 @@ impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
             message: message.into(),
         }
     }
@@ -788,7 +890,7 @@ mod tests {
             database_max_connections: 1,
             auto_publish: price::AutoPublishConfig::default(),
             admin_login: "oracle-admin".into(),
-            admin_password: "test-password".into(),
+            admin_password: "test-admin-password-0123".into(),
             policy_asset_id: "66".repeat(32),
             genesis_block_hash: "cd179c84c35f51825f20a3b91a18d45f0c53b5ceb744a5b6ef8f0babe809396f"
                 .into(),
@@ -1157,6 +1259,154 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn chain_proxy_stays_under_the_configured_base_path() {
+        let escaped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let escape_flag = escaped.clone();
+        let chain = Router::new()
+            .route(
+                "/liquidtestnet/api/blocks/tip/height",
+                get(|OriginalUri(uri): OriginalUri| async move {
+                    format!("100?{}", uri.query().unwrap_or(""))
+                }),
+            )
+            .route(
+                "/liquidtestnet/api/large",
+                get(|| async { vec![0u8; MAX_CHAIN_RESPONSE_BYTES + 1] }),
+            )
+            .fallback(move || {
+                escape_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                async { "outside the Esplora API" }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = config();
+        config.chain_backend.esplora_url = format!(
+            "http://{}/liquidtestnet/api",
+            listener.local_addr().unwrap()
+        );
+        let task = tokio::spawn(async move { axum::serve(listener, chain).await.unwrap() });
+        let app = App::new(config).await.unwrap();
+        let get_path = |path: &str| {
+            app.router().oneshot(
+                Request::builder()
+                    .uri(format!("/api/chain/{path}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+
+        let response = get_path("blocks/tip/height?limit=1").await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "100?limit=1"
+        );
+        // Single- and double-encoded dot segments, plain dots and empty segments.
+        for path in [
+            "%2e%2e/secret",
+            "%252e%252e/secret",
+            "%252E%252E/%252e%252e/secret",
+            "tx/%252e%252e%252f%252e%252e/secret",
+            "./blocks/tip/height",
+            "../secret",
+            "tx//hex",
+            "tx/abc%3Fx",
+        ] {
+            assert_eq!(
+                get_path(path).await.unwrap().status(),
+                StatusCode::BAD_REQUEST,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            get_path("large").await.unwrap().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(!escaped.load(std::sync::atomic::Ordering::Relaxed));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_admin_logins_back_off() {
+        let app = App::new(config()).await.unwrap();
+        let attempt = |password: &str| {
+            app.router().oneshot(json_request(
+                "POST",
+                "/api/admin/login",
+                serde_json::json!({ "login": "oracle-admin", "password": password }),
+            ))
+        };
+        for _ in 0..FREE_LOGIN_FAILURES - 1 {
+            assert_eq!(
+                attempt("wrong").await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            attempt("test-admin-password-0123").await.unwrap().status(),
+            StatusCode::OK
+        );
+        // A success resets the count, so the next failures start from zero again.
+        for _ in 0..FREE_LOGIN_FAILURES {
+            assert_eq!(
+                attempt("wrong").await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        // Once back-off starts, even the correct password waits.
+        assert_eq!(
+            attempt("test-admin-password-0123").await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        app.state.login_throttle.lock().await.locked_until = 0;
+        assert_eq!(
+            attempt("test-admin-password-0123").await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_credentials_come_from_startup_and_must_be_strong() {
+        for (login, password) in [
+            ("", "test-admin-password-0123"),
+            ("admin", ""),
+            ("admin", "short-password"),
+            ("admin", "prediction-demo"),
+            ("admin-login-0123456", "admin-login-0123456"),
+        ] {
+            let mut config = config();
+            config.admin_login = login.into();
+            config.admin_password = password.into();
+            assert!(matches!(
+                App::new(config).await,
+                Err(AppError::WeakAdminCredentials)
+            ));
+        }
+        let path = std::env::temp_dir().join(format!("admin-config-{}.toml", Uuid::new_v4()));
+        let contents = format!(
+            "listen_address = \"127.0.0.1:0\"\ndatabase_url = \"sqlite::memory:\"\npolicy_asset_id = \"{}\"\ngenesis_block_hash = \"{}\"\n",
+            "66".repeat(32),
+            "cd179c84c35f51825f20a3b91a18d45f0c53b5ceb744a5b6ef8f0babe809396f"
+        );
+        tokio::fs::write(
+            &path,
+            format!("{contents}admin_login = \"admin\"\nadmin_password = \"prediction-demo\"\n"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            Config::load(&path).await,
+            Err(AppError::AdminCredentialsInConfig)
+        ));
+        tokio::fs::write(&path, contents).await.unwrap();
+        let loaded = Config::load(&path).await.unwrap();
+        assert_eq!(
+            loaded.admin_login,
+            std::env::var(ADMIN_LOGIN_ENV).unwrap_or_default()
+        );
+        tokio::fs::remove_file(path).await.unwrap();
     }
 
     #[tokio::test]
