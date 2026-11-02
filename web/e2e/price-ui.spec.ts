@@ -83,6 +83,27 @@ test.beforeEach(async ({ page }) => {
   );
 });
 
+test("uses the page origin for API requests", async ({ page }) => {
+  await page.route("**/api/predictions", (route) =>
+    route.fulfill({ json: [] }),
+  );
+  await page.route("**/api/prices", (route) =>
+    route.fulfill({ json: [] }),
+  );
+  const requests = Promise.all(
+    ["/api/config", "/api/predictions", "/api/prices"].map((path) =>
+      page.waitForRequest((request) => new URL(request.url()).pathname === path),
+    ),
+  );
+  await page.goto("/");
+  await expect(
+    page.getByRole("heading", { name: "Markets", exact: true }),
+  ).toBeVisible();
+  for (const request of await requests) {
+    expect(new URL(request.url()).origin).toBe(new URL(page.url()).origin);
+  }
+});
+
 for (const viewport of [
   { width: 1440, height: 1000 },
   { width: 375, height: 667 },
@@ -720,7 +741,7 @@ test("new positions lock a host-matched escrow and sign only holder inputs", asy
       localStorage.setItem("storm-humid-regtest-chain", wallet.chainId);
       localStorage.setItem(
         "storm-humid-regtest-backend",
-        "http://127.0.0.1:3100/api/chain",
+        `${window.location.origin}/api/chain`,
       );
       localStorage.setItem(
         "signal-market:user-state:v3",
@@ -1077,7 +1098,7 @@ test("price proof survives reload, resumes once and signs only the wallet fee in
       localStorage.setItem("storm-humid-regtest-chain", wallet.chainId);
       localStorage.setItem(
         "storm-humid-regtest-backend",
-        "http://127.0.0.1:3100/api/chain",
+        `${window.location.origin}/api/chain`,
       );
       if (!localStorage.getItem("signal-market:user-state:v3"))
         localStorage.setItem(

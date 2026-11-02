@@ -17,6 +17,7 @@ services:
       retries: 30
 
   server:
+    image: ghcr.io/blockstreamresearch/simplicity-prediction-market-server:latest
     build:
       context: ..
       dockerfile: prediction-demo/server/Dockerfile
@@ -42,11 +43,14 @@ services:
       retries: 30
 
   web:
+    image: ghcr.io/blockstreamresearch/simplicity-prediction-market-web:latest
     build:
       context: ..
       dockerfile: prediction-demo/web/Dockerfile
       args:
-        VITE_SERVER_API: ${VITE_SERVER_API:-http://127.0.0.1:${API_PORT:-3100}}
+        VITE_SERVER_API: ${VITE_SERVER_API:-}
+    environment:
+      PREDICTION_API_UPSTREAM: http://server:3100
     restart: unless-stopped
     depends_on:
       server:

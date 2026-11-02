@@ -11,4 +11,9 @@ export default defineConfig({
   define: {
     global: "globalThis",
   },
+  server: {
+    proxy: {
+      "/api": "http://127.0.0.1:3100",
+    },
+  },
 });

@@ -108,7 +108,7 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: ${{ matrix.platform }}
-          build-args: ${{ matrix.suffix == 'web' && format('VITE_SERVER_API={0}', vars.VITE_SERVER_API || 'http://127.0.0.1:3100') || '' }}
+          build-args: ${{ matrix.suffix == 'web' && format('VITE_SERVER_API={0}', vars.VITE_SERVER_API || '') || '' }}
           outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
           labels: ${{ steps.metadata.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.suffix }}-${{ matrix.arch }}

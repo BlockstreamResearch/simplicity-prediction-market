@@ -74,7 +74,7 @@ const emptyPosition: Position = {
   priceRequestHash: '', priceClaim: null, priceSwept: false,
 }
 
-const serverApi = import.meta.env.VITE_SERVER_API ?? 'http://127.0.0.1:3100'
+const serverApi = import.meta.env.VITE_SERVER_API || window.location.origin
 const chainBackend = `${serverApi}/api/chain`
 const chain = new EsploraClient(chainBackend)
 const USER_STATE_KEY = 'signal-market:user-state:v3'

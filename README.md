@@ -6,20 +6,12 @@ A Liquid Testnet prediction market demo built with Simplicity, Price Oracle, and
 
 ## Quick Start
 
-Requires Docker Compose and the `price-oracle` repository alongside this one:
-
-```text
-workspace/
-  prediction-demo/
-  price-oracle/
-```
-
 From this repository, choose the Market desk admin credentials and start the stack. The server refuses to start without them; the password needs at least 16 characters. You can also put both variables in an untracked `.env` file.
 
 ```sh
 export PREDICTION_ADMIN_LOGIN=admin
 export PREDICTION_ADMIN_PASSWORD="$(openssl rand -base64 24)"
-docker compose up --build -d --wait
+docker compose up --no-build --pull always -d --wait
 ```
 
 Open the [web app](http://127.0.0.1:8080). The API runs at [http://127.0.0.1:3100](http://127.0.0.1:3100). Compose starts the frontend, API, and PostgreSQL using the official Liquid Testnet oracle. No local oracle stack is required.
@@ -46,7 +38,7 @@ cp docker/server.toml docker/server.local.toml
 PREDICTION_CONFIG=./docker/server.local.toml docker compose up -d --wait
 ```
 
-- **Ports:** override `API_PORT` and `WEB_PORT`. Set `VITE_SERVER_API` before building for a different browser-accessible API URL.
+- **Ports:** override `API_PORT` and `WEB_PORT`. The frontend uses the website's origin by default. Its Nginx `/api` proxy targets `PREDICTION_API_UPSTREAM` (`http://server:3100` in Compose; `http://127.0.0.1:3100` by default for a shared Kubernetes pod). Only set the build-time `VITE_SERVER_API` override when deliberately using a separate API origin.
 - **Oracle trust:** the demo uses `trust_coordinator = true` to discover current assets and the oracle root. This trusts the configured coordinator; independent `[oracle_verification]` pins are also supported. Do not enable both modes.
 - **Broadcasting:** Humid signs and broadcasts claims and sweeps through its own backend. Only the optional server relay needs Elements RPC for voucher burns.
 - **Admin credentials:** pass `PREDICTION_ADMIN_LOGIN` and `PREDICTION_ADMIN_PASSWORD` when starting the server; config files must not contain them. After five failed sign-ins in a row, the server makes all sign-in attempts wait, doubling the delay up to five minutes; each failure is logged. Live e2e tests read the same values from `TEST_ADMIN_LOGIN` and `TEST_ADMIN_PASSWORD`.
@@ -54,9 +46,11 @@ PREDICTION_CONFIG=./docker/server.local.toml docker compose up -d --wait
 
 ## Development
 
+To build the Docker images locally instead of pulling the published images, place the compatible `price-oracle` repository alongside this one and run `docker compose up --build -d --wait`. `make stage-up` always pulls the published images again.
+
 Source builds require Bun, Rust 1.97.1, Simplex 0.1.1, and the compatible sibling Price Oracle checkout. Run `simplex install && simplex build` in both repositories' `contracts` directories first.
 
-Create your local server config from [server/config.example.toml](server/config.example.toml). The example uses regtest: start the Price Oracle development stack and set `listen_address = "127.0.0.1:3100"` for the frontend's default API URL. Then start the server:
+Create your local server config from [server/config.example.toml](server/config.example.toml). The example uses regtest: start the Price Oracle development stack and set `listen_address = "127.0.0.1:3100"` for Vite's development API proxy. Then start the server:
 
 ```sh
 PREDICTION_ADMIN_LOGIN=admin PREDICTION_ADMIN_PASSWORD='<at least 16 characters>' cargo run -p prediction-demo-server
