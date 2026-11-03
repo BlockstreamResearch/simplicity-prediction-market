@@ -6,9 +6,11 @@ A Liquid Testnet prediction market demo built with Simplicity, Price Oracle, and
 
 ## Quick Start
 
-From this repository, choose the Market desk admin credentials and start the stack. The server refuses to start without them; the password needs at least 16 characters. You can also put both variables in an untracked `.env` file.
+From this repository, select the immutable server and web tags from a successful **Publish images** workflow run, choose the Market desk admin credentials, and start the stack. Replace the tag placeholders below with the published tags. The server refuses to start without admin credentials; the password needs at least 16 characters. You can also put these variables in an untracked `.env` file.
 
 ```sh
+export SERVER_IMAGE_TAG='<published server tag>'
+export WEB_IMAGE_TAG='<published web tag>'
 export PREDICTION_ADMIN_LOGIN=admin
 export PREDICTION_ADMIN_PASSWORD="$(openssl rand -base64 24)"
 docker compose up --no-build --pull always -d --wait
@@ -38,7 +40,8 @@ cp docker/server.toml docker/server.local.toml
 PREDICTION_CONFIG=./docker/server.local.toml docker compose up -d --wait
 ```
 
-- **Ports:** override `API_PORT` and `WEB_PORT`. The frontend uses the website's origin by default. Its Nginx `/api` proxy targets `PREDICTION_API_UPSTREAM` (`http://server:3100` in Compose; `http://127.0.0.1:3100` by default for a shared Kubernetes pod). Only set the build-time `VITE_SERVER_API` override when deliberately using a separate API origin.
+- **Images:** `SERVER_IMAGE_TAG` and `WEB_IMAGE_TAG` are required. Use the immutable tags from the publish run; the server and web timestamps may differ. Compose does not pull `latest`.
+- **Ports:** override `API_PORT` and `WEB_PORT`. The web container runs as UID 101 and listens on port 8080. The frontend uses the website's origin by default. Its Nginx `/api` proxy targets `PREDICTION_API_UPSTREAM` (`http://server:3100` in Compose; `http://127.0.0.1:3100` by default for a shared Kubernetes pod). Only set the build-time `VITE_SERVER_API` override when deliberately using a separate API origin.
 - **Oracle trust:** the demo uses `trust_coordinator = true` to discover current assets and the oracle root. This trusts the configured coordinator; independent `[oracle_verification]` pins are also supported. Do not enable both modes.
 - **Broadcasting:** Humid signs and broadcasts claims and sweeps through its own backend. Only the optional server relay needs Elements RPC for voucher burns.
 - **Admin credentials:** pass `PREDICTION_ADMIN_LOGIN` and `PREDICTION_ADMIN_PASSWORD` when starting the server; config files must not contain them. After five failed sign-ins in a row, the server makes all sign-in attempts wait, doubling the delay up to five minutes; each failure is logged. Live e2e tests read the same values from `TEST_ADMIN_LOGIN` and `TEST_ADMIN_PASSWORD`.
@@ -46,7 +49,7 @@ PREDICTION_CONFIG=./docker/server.local.toml docker compose up -d --wait
 
 ## Development
 
-To build the Docker images locally instead of pulling the published images, place the compatible `price-oracle` repository alongside this one and run `docker compose up --build -d --wait`. `make stage-up` always pulls the published images again.
+To build the Docker images locally instead of pulling the published images, set `PRICE_ORACLE_REF` to the same full Price Oracle commit SHA as the repository variable, then run `SERVER_IMAGE_TAG=local WEB_IMAGE_TAG=local docker compose up --build -d --wait`. Docker builds fetch that exact revision and do not use a sibling checkout. `make stage-up` always pulls the selected published tags.
 
 Source builds require Bun, Rust 1.97.1, Simplex 0.1.1, and the compatible sibling Price Oracle checkout. Run `simplex install && simplex build` in both repositories' `contracts` directories first.
 
@@ -75,6 +78,20 @@ bunx playwright test e2e/price-ui.spec.ts
 ```
 
 Live integration tests require a dedicated regtest stack and modify chain state. Do not run them against funded deployments.
+
+## Image Publishing
+
+Pushes to `main` publish the server and web images through [Blockstream's signed build workflow](https://github.com/Blockstream/ci-components/blob/v1/.github/workflows/publish.yml). Both `linux/amd64` and `linux/arm64` are built without registry credentials in `staging-build`; publishing and keyless signing run in the `staging` GitHub environment without executing repository code.
+
+Set these **repository variables**, not just environment variables:
+
+- `GCP_WORKLOAD_IDENTITY_PROVIDER` and `GCP_SERVICE_ACCOUNT`: the GCP publishing identity.
+- `SERVER_IMAGE_NAME`: `us-central1-docker.pkg.dev/blockstream/gh-prediction-market/server`.
+- `WEB_IMAGE_NAME`: `us-central1-docker.pkg.dev/blockstream/gh-prediction-market/web`.
+- `PRICE_ORACLE_REF`: a full compatible Price Oracle commit SHA.
+- `VITE_SERVER_API`: optional build-time API origin override; leave unset for the same-origin proxy.
+
+Each image receives the shared workflow's default immutable `<commit>-<UTC timestamp>` tag; no `latest` tag is published. Set `SERVER_IMAGE_TAG` and `WEB_IMAGE_TAG` to the published tags before starting Compose. The old release-triggered GHCR publishing workflow is no longer used.
 
 ## Safety
 

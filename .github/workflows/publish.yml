@@ -1,0 +1,87 @@
+name: Publish images
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: publish-main
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'BlockstreamResearch/simplicity-prediction-market'
+    runs-on: ubuntu-latest
+    outputs:
+      server-image: ${{ steps.images.outputs.server-image }}
+      server-name: ${{ steps.images.outputs.server-name }}
+      web-image: ${{ steps.images.outputs.web-image }}
+      web-name: ${{ steps.images.outputs.web-name }}
+    steps:
+      - name: Validate the oracle revision and resolve image paths
+        id: images
+        env:
+          PRICE_ORACLE_REF: ${{ vars.PRICE_ORACLE_REF }}
+          SERVER_IMAGE_NAME: ${{ vars.SERVER_IMAGE_NAME }}
+          WEB_IMAGE_NAME: ${{ vars.WEB_IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$PRICE_ORACLE_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Set PRICE_ORACLE_REF to a full oracle commit SHA containing Simplex 0.1.1 and the hardened verification SDK."
+            exit 1
+          fi
+          for image in "$SERVER_IMAGE_NAME" "$WEB_IMAGE_NAME"; do
+            if [[ ! "$image" =~ ^[a-z0-9-]+-docker\.pkg\.dev/[a-z0-9-]+/[a-z0-9-]+/[a-z0-9-]+$ ]]; then
+              echo "::error::SERVER_IMAGE_NAME and WEB_IMAGE_NAME must be full Artifact Registry image paths without tags."
+              exit 1
+            fi
+          done
+          if [[ "${SERVER_IMAGE_NAME##*/}" == "${WEB_IMAGE_NAME##*/}" ]]; then
+            echo "::error::Server and web image names must differ so their OCI build artifacts do not collide."
+            exit 1
+          fi
+          {
+            printf 'server-image=%s\n' "${SERVER_IMAGE_NAME%/*}"
+            printf 'server-name=%s\n' "${SERVER_IMAGE_NAME##*/}"
+            printf 'web-image=%s\n' "${WEB_IMAGE_NAME%/*}"
+            printf 'web-name=%s\n' "${WEB_IMAGE_NAME##*/}"
+          } >> "$GITHUB_OUTPUT"
+
+  server:
+    needs: prepare
+    permissions:
+      contents: read
+      id-token: write
+    uses: Blockstream/ci-components/.github/workflows/publish.yml@v1
+    with:
+      workload-identity-provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      service-account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      image: ${{ needs.prepare.outputs.server-image }}
+      image-name: ${{ needs.prepare.outputs.server-name }}
+      environment: staging
+      dockerfile: server/Dockerfile
+      platforms: |
+        linux/amd64
+        linux/arm64
+      build-arg-vars: PRICE_ORACLE_REF
+
+  web:
+    needs: prepare
+    permissions:
+      contents: read
+      id-token: write
+    uses: Blockstream/ci-components/.github/workflows/publish.yml@v1
+    with:
+      workload-identity-provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      service-account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      image: ${{ needs.prepare.outputs.web-image }}
+      image-name: ${{ needs.prepare.outputs.web-name }}
+      environment: staging
+      dockerfile: web/Dockerfile
+      platforms: |
+        linux/amd64
+        linux/arm64
+      build-arg-vars: PRICE_ORACLE_REF
+      build-args: VITE_SERVER_API=${{ vars.VITE_SERVER_API }}

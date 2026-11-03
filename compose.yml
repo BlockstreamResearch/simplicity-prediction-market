@@ -17,10 +17,12 @@ services:
       retries: 30
 
   server:
-    image: ghcr.io/blockstreamresearch/simplicity-prediction-market-server:latest
+    image: us-central1-docker.pkg.dev/blockstream/gh-prediction-market/server:${SERVER_IMAGE_TAG:?set SERVER_IMAGE_TAG to a published server tag, or local for a local build}
     build:
-      context: ..
-      dockerfile: prediction-demo/server/Dockerfile
+      context: .
+      dockerfile: server/Dockerfile
+      args:
+        PRICE_ORACLE_REF: ${PRICE_ORACLE_REF:-}
     restart: unless-stopped
     environment:
       RUST_LOG: ${RUST_LOG:-info,sqlx=warn}
@@ -43,11 +45,12 @@ services:
       retries: 30
 
   web:
-    image: ghcr.io/blockstreamresearch/simplicity-prediction-market-web:latest
+    image: us-central1-docker.pkg.dev/blockstream/gh-prediction-market/web:${WEB_IMAGE_TAG:?set WEB_IMAGE_TAG to a published web tag, or local for a local build}
     build:
-      context: ..
-      dockerfile: prediction-demo/web/Dockerfile
+      context: .
+      dockerfile: web/Dockerfile
       args:
+        PRICE_ORACLE_REF: ${PRICE_ORACLE_REF:-}
         VITE_SERVER_API: ${VITE_SERVER_API:-}
     environment:
       PREDICTION_API_UPSTREAM: http://server:3100
@@ -56,9 +59,9 @@ services:
       server:
         condition: service_healthy
     ports:
-      - "127.0.0.1:${WEB_PORT:-8080}:80"
+      - "127.0.0.1:${WEB_PORT:-8080}:8080"
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--output-document=/dev/null", "http://127.0.0.1/"]
+      test: ["CMD", "wget", "--quiet", "--output-document=/dev/null", "http://127.0.0.1:8080/"]
       interval: 5s
       timeout: 3s
       retries: 20

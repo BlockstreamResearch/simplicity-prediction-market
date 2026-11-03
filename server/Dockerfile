@@ -1,13 +1,19 @@
+# syntax=docker/dockerfile:1.6
+
 FROM rust:1.97.1-bookworm AS builder
 
 ARG SIMPLEX_VERSION=0.1.1
+ARG PRICE_ORACLE_REF
+
+RUN printf '%s\n' "$PRICE_ORACLE_REF" | grep -Eq '^[0-9a-fA-F]{40}$' \
+    || { echo "PRICE_ORACLE_REF must be a full oracle commit SHA" >&2; exit 1; }
 
 WORKDIR /workspace
+ADD https://github.com/BlockstreamResearch/price-oracle.git#${PRICE_ORACLE_REF} ./price-oracle
 RUN cargo install --locked \
     --git https://github.com/BlockstreamResearch/smplx.git \
     --tag "v${SIMPLEX_VERSION}" smplx-cli
-COPY price-oracle ./price-oracle
-COPY prediction-demo ./prediction-demo
+COPY . ./prediction-demo
 RUN cd price-oracle/contracts && simplex install && simplex build
 RUN cd prediction-demo/contracts && simplex install && simplex build
 RUN cargo build --locked --release \

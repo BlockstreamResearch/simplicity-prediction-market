@@ -1,11 +1,6 @@
 **
-!prediction-demo/
-!prediction-demo/web/
-!prediction-demo/web/**
-!price-oracle/
-!price-oracle/web/
-!price-oracle/web/sdk/
-!price-oracle/web/sdk/**
+!web/
+!web/**
 **/node_modules
 **/dist
 **/.git
