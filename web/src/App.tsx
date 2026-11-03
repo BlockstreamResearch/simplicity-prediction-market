@@ -21,6 +21,7 @@ import { connectHumid, getHumidUtxos, HumidNotDetectedError, revokeHumidSession,
 import { displayPrice, fundOracleRequest, loadOracleVerification, meetsMarket, meetsPriceTick, PRICE_VALIDITY_EXTENSION_SECONDS, verifyIssuedPriceOutputs, verifyMarketAssets, waitForOutput, type PriceClaim, type PriceMarket } from './price-market'
 import PriceDesk from './PriceDesk'
 import HumidInstallDialog from './HumidInstallDialog'
+import { fetchAdmin } from './admin-api'
 
 const SATS = 100_000_000
 const TRANSACTION_FEE = 1_000
@@ -126,7 +127,8 @@ function useAutoDismiss(notice: Notice | null, setNotice: (notice: Notice | null
 }
 
 async function json<Result>(path: string, init?: RequestInit): Promise<Result> {
-  const response = await fetch(`${serverApi}${path}`, init)
+  const request = path.startsWith('/api/admin/') ? fetchAdmin : fetch
+  const response = await request(`${serverApi}${path}`, init)
   const body = (await response.json()) as Result | { error: string }
   if (!response.ok) {
     const error = body as { error?: string }

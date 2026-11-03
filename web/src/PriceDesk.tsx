@@ -7,6 +7,7 @@ import HumidInstallDialog from './HumidInstallDialog'
 import { addWalletInputDerivation, EsploraClient } from './wallet'
 import { displayPrice, fundOracleRequest, loadOracleVerification, scaledPrice, verifyMarketAssets, waitForOutput, type ExplicitUtxo, type PriceMarket } from './price-market'
 import type { ServerConfig } from './App'
+import { fetchAdmin } from './admin-api'
 
 type Market = { id: string; title: string; deadline: number; price: PriceMarket }
 type ReserveStatus = { configured: boolean; funding_address: string | null; balance_sats: number; available_sats: number; reserved_sats: number; utxo_count: number; max_stake_sats: number }
@@ -15,7 +16,7 @@ const KEY = 'signal-market:house-sweep:v1'
 const emptySweep: SweepState = { marketId: '', positionOutpoint: '', payoutScript: '', feeOutpoint: '', reserve: null, requestHash: '', tick: null, txid: '' }
 
 async function fetchReserves(serverApi: string, token: string, signal?: AbortSignal): Promise<ReserveStatus> {
-  const response = await fetch(`${serverApi}/api/admin/escrow`, { headers: { authorization: `Bearer ${token}` }, signal })
+  const response = await fetchAdmin(`${serverApi}/api/admin/escrow`, { headers: { authorization: `Bearer ${token}` }, signal })
   const result = await response.json() as ReserveStatus & { error?: string }
   if (!response.ok) throw new Error(result.error ?? 'Escrow reserves unavailable')
   return result
@@ -99,7 +100,7 @@ export default function PriceDesk({ token, predictions, refresh, serverApi, coor
   }, [feed, serverApi])
 
   async function api<Result>(path: string, body: unknown): Promise<Result> {
-    const response = await fetch(`${serverApi}${path}`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    const response = await fetchAdmin(`${serverApi}${path}`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(body) })
     const result = await response.json() as Result & { error?: string }
     if (!response.ok) throw new Error(result.error ?? 'Market request failed')
     return result

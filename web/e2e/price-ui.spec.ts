@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { once } from "node:events";
+import { createServer } from "node:http";
 import { expect, test, type Page } from "@playwright/test";
 import { deriveAccount, type AccountVerification } from "@price-oracle/sdk";
 import * as ecc from "@bitcoinerlab/secp256k1";
@@ -102,6 +104,197 @@ test("uses the page origin for API requests", async ({ page }) => {
   for (const request of await requests) {
     expect(new URL(request.url()).origin).toBe(new URL(page.url()).origin);
   }
+});
+
+test("admin login uses browser single sign-on before operator credentials", async ({
+  page,
+}) => {
+  await page.route("**/api/predictions", (route) =>
+    route.fulfill({ json: [] }),
+  );
+  await page.route("**/api/prices", (route) => route.fulfill({ json: [] }));
+  const gatewayRequests: {
+    navigation: boolean;
+    method: string;
+    body: string | null;
+    authorization: string | undefined;
+    returnTo: string | null;
+  }[] = [];
+  const providerRequests: boolean[] = [];
+  const corsErrors: string[] = [];
+  let signedIn = false;
+  let loginRequests = 0;
+  let returnTo = "";
+  const provider = createServer((request, response) => {
+    if (request.url !== "/auth") {
+      response.writeHead(404).end();
+      return;
+    }
+    providerRequests.push(request.headers["sec-fetch-mode"] === "navigate");
+    expect(request.method).toBe("GET");
+    expect(request.headers.authorization).toBeUndefined();
+    expect(request.headers["content-length"]).toBeUndefined();
+    response.writeHead(200, { "content-type": "text/html" });
+    response.end(
+      `<h1>Identity provider</h1><a href="${new URL("/oauth2/callback", returnTo).href}">Complete test sign-in</a>`,
+    );
+  });
+  provider.listen(0, "127.0.0.1");
+  await once(provider, "listening");
+  try {
+    const address = provider.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Identity provider fixture did not bind a TCP port");
+    }
+    const identityProvider = `http://127.0.0.1:${address.port}/auth`;
+    page.on("console", (message) => {
+      if (message.type() === "error" && message.text().includes("CORS")) {
+        corsErrors.push(message.text());
+      }
+    });
+    await page.route("**/api/admin/login", (route) => {
+      expect(route.request().method()).toBe("POST");
+      expect(route.request().postDataJSON()).toEqual({
+        login: "operator",
+        password: "fixture-password",
+      });
+      loginRequests += 1;
+      if (!signedIn) {
+        return route.fulfill({
+          status: 302,
+          headers: { location: "/oauth2/start?rd=%2Fapi%2Fadmin%2Flogin" },
+        });
+      }
+      expect(route.request().headers().cookie).toContain(
+        "oauth2_proxy=fixture-sso",
+      );
+      return route.fulfill({ json: { token: "fixture-token" } });
+    });
+    await page.route("**/oauth2/start?*", (route) => {
+      const request = route.request();
+      gatewayRequests.push({
+        navigation: request.isNavigationRequest(),
+        method: request.method(),
+        body: request.postData(),
+        authorization: request.headers().authorization,
+        returnTo: new URL(request.url()).searchParams.get("rd"),
+      });
+      return route.fulfill({
+        status: 302,
+        headers: { location: identityProvider },
+      });
+    });
+    await page.route("**/oauth2/callback", (route) => {
+      signedIn = true;
+      return route.fulfill({
+        status: 302,
+        headers: {
+          location: returnTo,
+          "set-cookie": "oauth2_proxy=fixture-sso; Path=/; HttpOnly; SameSite=Lax",
+        },
+      });
+    });
+
+    await page.goto("/?auth-test=1#market-desk");
+    returnTo = page.url();
+    await page.getByRole("button", { name: "Demo", exact: true }).click();
+    await page.getByLabel("Login", { exact: true }).fill("operator");
+    await page.getByLabel("Password", { exact: true }).fill("fixture-password");
+    await page.getByRole("button", { name: "Sign in", exact: true }).click();
+    await expect(page).toHaveURL(identityProvider, { timeout: 10_000 });
+    expect(gatewayRequests).toEqual([
+      {
+        navigation: true,
+        method: "GET",
+        body: null,
+        authorization: undefined,
+        returnTo,
+      },
+    ]);
+    expect(providerRequests).toEqual([true]);
+    expect(loginRequests).toBe(1);
+    expect(corsErrors).toEqual([]);
+
+    await page.getByRole("link", { name: "Complete test sign-in" }).click();
+    await expect(page).toHaveURL(returnTo);
+    await expect(
+      page.getByRole("heading", { name: "Operator access" }),
+    ).toBeVisible();
+    expect(
+      await page.evaluate(() => sessionStorage.getItem("admin-token")),
+    ).toBeNull();
+    await page.getByLabel("Login", { exact: true }).fill("operator");
+    await page.getByLabel("Password", { exact: true }).fill("fixture-password");
+    await page.getByRole("button", { name: "Sign in", exact: true }).click();
+    await expect(
+      page.getByRole("heading", { name: "Market desk" }),
+    ).toBeVisible();
+    expect(loginRequests).toBe(2);
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      provider.close((error) => (error ? reject(error) : resolve()));
+    });
+  }
+});
+
+test("expired gateway single sign-on navigates before loading admin reserves", async ({
+  page,
+}) => {
+  await page.route("**/api/predictions", (route) =>
+    route.fulfill({ json: [] }),
+  );
+  await page.route("**/api/prices", (route) => route.fulfill({ json: [] }));
+  let returnTo = "";
+  await page.route("**/api/admin/escrow", (route) => {
+    returnTo = new URL("/", route.request().url()).href;
+    return route.fulfill({
+      status: 302,
+      headers: { location: "/oauth2/start?rd=%2Fapi%2Fadmin%2Fescrow" },
+    });
+  });
+  await page.route("**/oauth2/start?*", (route) => {
+    expect(route.request().isNavigationRequest()).toBe(true);
+    expect(route.request().headers().authorization).toBeUndefined();
+    expect(new URL(route.request().url()).searchParams.get("rd")).toBe(
+      returnTo,
+    );
+    return route.fulfill({
+      contentType: "text/html",
+      body: "<h1>Single sign-on</h1>",
+    });
+  });
+  await page.addInitScript(() => {
+    sessionStorage.setItem("admin-token", "fixture-token");
+    localStorage.setItem("signal-market:mode", "admin");
+  });
+  await page.goto("/");
+  await expect(
+    page.getByRole("heading", { name: "Single sign-on", exact: true }),
+  ).toBeVisible({ timeout: 10_000 });
+  expect(new URL(page.url()).pathname).toBe("/oauth2/start");
+});
+
+test("operator login errors do not start single sign-on", async ({ page }) => {
+  await page.route("**/api/predictions", (route) =>
+    route.fulfill({ json: [] }),
+  );
+  await page.route("**/api/prices", (route) => route.fulfill({ json: [] }));
+  await page.route("**/api/admin/login", (route) =>
+    route.fulfill({
+      status: 401,
+      json: { error: "invalid login or password" },
+    }),
+  );
+  await page.goto("/");
+  await page.getByRole("button", { name: "Demo", exact: true }).click();
+  await page.getByLabel("Login", { exact: true }).fill("operator");
+  await page.getByLabel("Password", { exact: true }).fill("wrong-password");
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await expect(page.getByText("invalid login or password")).toBeVisible();
+  expect(new URL(page.url()).pathname).toBe("/");
+  expect(
+    await page.evaluate(() => sessionStorage.getItem("admin-token")),
+  ).toBeNull();
 });
 
 for (const viewport of [
