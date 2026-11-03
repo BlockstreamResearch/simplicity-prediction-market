@@ -53,6 +53,8 @@ To build the Docker images locally instead of pulling the published images, set 
 
 Source builds require Bun, Rust 1.97.1, Simplex 0.1.1, and the compatible sibling Price Oracle checkout. Run `simplex install && simplex build` in both repositories' `contracts` directories first.
 
+Generated dependencies under `contracts/deps/` must stay untracked; `simplex install` recreates them. Do not commit the nested Git checkouts as submodules.
+
 Create your local server config from [server/config.example.toml](server/config.example.toml). The example uses regtest: start the Price Oracle development stack and set `listen_address = "127.0.0.1:3100"` for Vite's development API proxy. Then start the server:
 
 ```sh
